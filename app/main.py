@@ -6,7 +6,7 @@ from app.models.schemas import TaskReport
 
 
 def print_header(orchestrator: Orchestrator) -> None:
-    print("\n=== AI ENGINEER AGENT ===")
+    print("\n=== AI ENGINEER AGENT V2.0 ===")
     print(f"Project: {PROJECT_ROOT}")
     print(f"Mode: {orchestrator.mode.value}")
     print("Type /help for commands, /exit to quit.\n")
@@ -17,6 +17,8 @@ def print_help() -> None:
     print("  /help    - Show this help")
     print("  /status  - Show current configuration")
     print("  /mode    - Change execution mode")
+    print("  /plan    - Show current plan")
+    print("  /context - Show current context summary")
     print("  /clear   - Clear conversation history")
     print("  /exit    - Exit the agent")
     print()
@@ -27,6 +29,50 @@ def print_status(orchestrator: Orchestrator) -> None:
     print(f"Mode: {orchestrator.mode.value}")
     print(f"Tools: {', '.join(orchestrator.core.tools.keys())}")
     print(f"Max retry cycles: {MAX_RETRY_CYCLES}")
+    budget = orchestrator.budget.status()
+    print(f"Budget: {budget['llm_calls']}/{budget['max_llm_calls']} LLM calls, "
+          f"{budget['tool_calls']}/{budget['max_tool_calls']} tool calls")
+    if orchestrator.context.plan:
+        print(f"Plan: {len(orchestrator.context.plan.get('subtasks', []))} subtasks")
+    print()
+
+
+def print_plan(orchestrator: Orchestrator) -> None:
+    plan = orchestrator.context.plan
+    if not plan:
+        print("\nNo plan available.\n")
+        return
+
+    print(f"\n--- Plan ---")
+    print(f"Objective: {plan.get('objective', 'N/A')}")
+    subtasks = plan.get("subtasks", [])
+    if subtasks:
+        for st in subtasks:
+            st_id = st.get("id", "?")
+            desc = st.get("description", "")
+            status = st.get("status", "PENDING")
+            print(f"  [{status}] {st_id}: {desc}")
+    print()
+
+
+def print_context(orchestrator: Orchestrator) -> None:
+    ctx = orchestrator.context
+    print(f"\n--- Context ---")
+    print(f"Phase: {ctx.current_phase}")
+    print(f"Phase history: {' -> '.join(ctx.phase_history)}")
+    print(f"Iterations: {ctx.iteration_count}, Retries: {ctx.retry_count}")
+
+    if ctx.inspected_files:
+        print(f"Inspected files: {len(ctx.inspected_files)}")
+
+    if ctx.diagnoses:
+        print(f"Diagnoses: {len(ctx.diagnoses)}")
+
+    if ctx.fixes:
+        print(f"Fixes: {len(ctx.fixes)}")
+
+    if ctx.review_feedback:
+        print(f"Review feedback: pending")
     print()
 
 
@@ -116,6 +162,14 @@ def main() -> None:
 
         if user_input == "/status":
             print_status(orchestrator)
+            continue
+
+        if user_input == "/plan":
+            print_plan(orchestrator)
+            continue
+
+        if user_input == "/context":
+            print_context(orchestrator)
             continue
 
         if user_input == "/mode":

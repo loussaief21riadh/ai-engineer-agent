@@ -53,12 +53,14 @@ class AgentCore:
         self,
         client: OpenRouterClient | None = None,
         tools: dict[str, BaseTool] | None = None,
+        on_llm_call: Any = None,
     ) -> None:
         self.client = client or OpenRouterClient()
         self.tools = tools or {}
         self.history: list[AgentMessage] = []
         self.executions: list[ToolExecution] = []
         self._use_native_tools = True
+        self._on_llm_call = on_llm_call
 
     def register_tool(self, tool: BaseTool) -> None:
         self.tools[tool.schema.name] = tool
@@ -94,6 +96,8 @@ IMPORTANT: Only call one tool at a time. After receiving the tool result, contin
     def _call_llm(self, messages: list[dict[str, str]], model: str = "") -> ChatResponse:
         effective_model = model or PRIMARY_MODEL
         tool_defs = build_tool_definitions(self.tools) if self._use_native_tools and self.tools else None
+        if self._on_llm_call is not None:
+            self._on_llm_call()
         return self.client.chat(messages=messages, model=effective_model, tools=tool_defs)
 
     def _extract_tool_calls(self, chat_response: ChatResponse) -> list[ToolCall]:

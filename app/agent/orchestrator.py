@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.agent.context import ContextBuilder, TaskContext, TrustLevel
 from app.agent.core import AgentCore
+from app.agent.diagnostics import FailureAnalyzer
 from app.agent.phases import TaskPhase, can_transition
+from app.agent.planner import PlanValidator
+from app.agent.quota import BudgetTracker
 from app.agent.reviewer import Reviewer
+from app.agent.validator import Validator
 from app.config import AGENT_MODE, MAX_RETRY_CYCLES, AgentMode
 from app.llm.openrouter import OpenRouterClient
 from app.models.schemas import TaskReport, ToolExecution
 from app.tools.base import BaseTool
+from app.tools.edit import EditFileTool
 from app.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
 from app.tools.terminal import RunCommandTool
 from app.tools.testing import RunTestsTool
@@ -30,6 +36,7 @@ def _build_report_from_executions(
     diagnoses: list[str] | None = None,
     fixes: list[str] | None = None,
     stop_reason: str = "completed",
+    validation_report: Any = None,
 ) -> TaskReport:
     files_inspected: list[str] = []
     files_modified: list[str] = []
@@ -51,7 +58,7 @@ def _build_report_from_executions(
             if label not in files_inspected:
                 files_inspected.append(label)
 
-        elif ex.tool_name == "write_file":
+        elif ex.tool_name in ("write_file", "edit_file"):
             path = ex.arguments.get("path", "")
             if path and path not in files_modified:
                 files_modified.append(path)
@@ -99,12 +106,22 @@ class Orchestrator:
     ) -> None:
         self.client = client or OpenRouterClient()
         self.mode = mode or AGENT_MODE
-        self.core = AgentCore(client=self.client)
+
+        self.context = TaskContext()
+        self.context_builder = ContextBuilder()
+        self.failure_analyzer = FailureAnalyzer()
+        self.validator = Validator()
+        self.budget = BudgetTracker()
+
+        self.core = AgentCore(client=self.client, on_llm_call=self.budget.record_llm_call)
         self.reviewer = Reviewer(client=self.client)
         self._accumulated_executions: list[ToolExecution] = []
         self._last_review_result: Any = None
         self._review_retry_count: int = 0
         self._review_feedback: str = ""
+        self._plan_validated = False
+        self._plan_rejected = False
+
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -117,6 +134,7 @@ class Orchestrator:
 
         if self.mode in (AgentMode.ALLOW_EDITS, AgentMode.FULL_AUTONOMOUS):
             self.core.register_tool(WriteFileTool())
+            self.core.register_tool(EditFileTool())
 
     def set_mode(self, mode: AgentMode) -> None:
         self.mode = mode
@@ -140,10 +158,37 @@ class Orchestrator:
         self._review_retry_count = 0
         self._review_feedback = ""
 
+        self.context = TaskContext(task=user_message)
+        self.context.transition_to("UNDERSTAND")
+        self.context.add_observation("Task received by orchestrator", trust=TrustLevel.USER_ASSERTED)
+
+        self.budget.start()
+        self._plan_validated = False
+        self._plan_rejected = False
+
         max_iterations = 50
 
         while current_phase not in (TaskPhase.DONE, TaskPhase.FAILED):
+            if not self.budget.is_within_budget():
+                violation = self.budget.budget_violation() or "Budget exceeded"
+                return _build_report_from_executions(
+                    task=user_message,
+                    mode=self.mode.value,
+                    final_response=f"Budget limit reached: {violation}",
+                    steps_taken=len(self.core.history),
+                    executions=list(self._accumulated_executions),
+                    final_phase=current_phase.value,
+                    phase_history=phase_history,
+                    iteration_count=iteration_count,
+                    retry_count=retry_count,
+                    diagnoses=diagnoses,
+                    fixes=fixes,
+                    stop_reason="budget_exceeded",
+                )
+
             iteration_count += 1
+            self.context.iteration_count = iteration_count
+            self.context.retry_count = retry_count
 
             if iteration_count > max_iterations:
                 return _build_report_from_executions(
@@ -171,7 +216,9 @@ class Orchestrator:
                 current_phase = self._phase_inspect(user_message, phase_history)
 
             elif current_phase == TaskPhase.IMPLEMENT:
-                current_phase = self._phase_implement(user_message, phase_history)
+                current_phase = self._phase_implement(
+                    user_message, phase_history
+                )
 
             elif current_phase == TaskPhase.TEST:
                 test_passed, current_phase = self._phase_test(
@@ -218,6 +265,7 @@ class Orchestrator:
                 current_phase = TaskPhase.FAILED
                 phase_history.append(current_phase.value)
 
+        self.budget.stop()
         final_response = self._get_final_response()
 
         return _build_report_from_executions(
@@ -243,6 +291,23 @@ class Orchestrator:
         self.core.executions.clear()
         result = self.core.run(phase_prompt, max_steps=10)
         self._accumulated_executions.extend(self.core.executions)
+
+        for ex in self.core.executions:
+            self.budget.record_tool_call()
+            self.context.record_execution({
+                "tool_name": ex.tool_name,
+                "success": ex.success,
+                "arguments": ex.arguments,
+            })
+            if ex.tool_name == "read_file" and ex.success:
+                path = ex.arguments.get("path", "")
+                content = str(ex.result)[:500] if ex.result else ""
+                self.context.record_inspected_file(path, content)
+                self.context.add_observation(
+                    f"Read file {path}",
+                    trust=TrustLevel.TOOL_VERIFIED,
+                )
+
         return result
 
     def _record_test_execution(self, result: dict) -> None:
@@ -254,41 +319,109 @@ class Orchestrator:
             result=result.get("result"),
             error=result.get("error"),
         ))
+        self.context.test_results = result
+        if not result.get("success", False):
+            stdout = ""
+            if isinstance(result.get("result"), dict):
+                stdout = result["result"].get("stdout", "")
+            elif result.get("error"):
+                stdout = result["error"]
+            self.context.record_failure(stdout[:500])
 
     def _phase_understand(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
-        prompt = f"Task: {task}\n\nPhase: UNDERSTAND\nAnalyze the task. What is being asked? What files are likely involved? Do not make changes yet."
+        self.context.transition_to("UNDERSTAND")
+        prompt = self.context_builder.build_phase_prompt(
+            self.context, "UNDERSTAND", task
+        )
+        prompt += "\n\nAnalyze the task. What is being asked? What files are likely involved? Do not make changes yet."
         self._run_agent_step(prompt)
         return self._advance(TaskPhase.UNDERSTAND, TaskPhase.PLAN, phase_history)
 
     def _phase_plan(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
-        prompt = f"Task: {task}\n\nPhase: PLAN\nCreate a step-by-step plan. List the files to inspect and changes to make. Do not implement yet."
-        self._run_agent_step(prompt)
+        self.context.transition_to("PLAN")
+        prompt = self.context_builder.build_phase_prompt(
+            self.context, "PLAN", task
+        )
+        prompt += (
+            "\n\nCreate a step-by-step plan. List the files to inspect and changes to make. "
+            "Do not implement yet."
+        )
+        response = self._run_agent_step(prompt)
+
+        try:
+            import json as _json
+            data = _json.loads(response)
+            is_valid, errors, plan = PlanValidator.validate_plan(data)
+            if is_valid and plan is not None:
+                self.context.set_plan(plan.to_dict())
+                self._plan_validated = True
+                self._plan_rejected = False
+                self.context.add_observation(
+                    "Plan validated successfully",
+                    trust=TrustLevel.SYSTEM_DERIVED,
+                )
+            else:
+                self._plan_validated = False
+                self._plan_rejected = True
+                self.context.add_observation(
+                    f"Plan validation failed: {'; '.join(errors)}",
+                    trust=TrustLevel.MODEL_INFERRED,
+                )
+                phase_history.append(TaskPhase.FAILED.value)
+                return TaskPhase.FAILED
+        except (_json.JSONDecodeError, ValueError):
+            self._plan_validated = False
+            self._plan_rejected = False
+            self.context.add_observation(
+                "Plan response was not structured JSON; proceeding with free-text plan",
+                trust=TrustLevel.MODEL_INFERRED,
+            )
+
         return self._advance(TaskPhase.PLAN, TaskPhase.INSPECT, phase_history)
 
     def _phase_inspect(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
-        prompt = f"Task: {task}\n\nPhase: INSPECT\nRead the relevant files. Understand the current code before making changes."
+        self.context.transition_to("INSPECT")
+        prompt = self.context_builder.build_phase_prompt(
+            self.context, "INSPECT", task
+        )
+        prompt += (
+            "\n\nRead the relevant files. Understand the current code before making changes."
+        )
         self._run_agent_step(prompt)
         return self._advance(TaskPhase.INSPECT, TaskPhase.IMPLEMENT, phase_history)
 
     def _phase_implement(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
+        self.context.transition_to("IMPLEMENT")
         if self.mode == AgentMode.READ_ONLY:
-            prompt = f"Task: {task}\n\nPhase: IMPLEMENT (READ-ONLY)\nYou are in read-only mode. You cannot write files. Analyze what changes would be needed and report them."
+            prompt = self.context_builder.build_phase_prompt(
+                self.context, "IMPLEMENT (READ-ONLY)", task
+            )
+            prompt += (
+                "\n\nYou are in read-only mode. You cannot write files. "
+                "Analyze what changes would be needed and report them."
+            )
         else:
-            prompt = f"Task: {task}\n\nPhase: IMPLEMENT\nImplement the planned changes. Make minimal, targeted modifications."
+            prompt = self.context_builder.build_phase_prompt(
+                self.context, "IMPLEMENT", task
+            )
+            prompt += (
+                "\n\nImplement the planned changes. Make minimal, targeted modifications."
+            )
         self._run_agent_step(prompt)
         return self._advance(TaskPhase.IMPLEMENT, TaskPhase.TEST, phase_history)
 
     def _phase_test(
         self, task: str, phase_history: list[str]
     ) -> tuple[bool, TaskPhase]:
+        self.context.transition_to("TEST")
         test_tool = self.core.tools.get("run_tests")
         if test_tool is None:
             return True, self._advance(
@@ -296,14 +429,21 @@ class Orchestrator:
             )
 
         result = test_tool.execute(args="-v")
+        self.budget.record_tool_call()
         self._record_test_execution(result)
         success = result.get("success", False)
 
         if success:
+            self.context.add_observation(
+                "Tests passed", trust=TrustLevel.TOOL_VERIFIED
+            )
             return True, self._advance(
                 TaskPhase.TEST, TaskPhase.REVIEW, phase_history
             )
         else:
+            self.context.add_observation(
+                "Tests failed", trust=TrustLevel.TOOL_VERIFIED
+            )
             return False, self._advance(
                 TaskPhase.TEST, TaskPhase.DIAGNOSE, phase_history
             )
@@ -314,6 +454,7 @@ class Orchestrator:
         phase_history: list[str],
         diagnoses: list[str],
     ) -> TaskPhase:
+        self.context.transition_to("DIAGNOSE")
         test_failures = ""
         for ex in reversed(self._accumulated_executions):
             if ex.tool_name == "run_tests" and not ex.success:
@@ -323,15 +464,25 @@ class Orchestrator:
                     test_failures = ex.error
                 break
 
-        prompt = (
-            f"Task: {task}\n\n"
-            f"Phase: DIAGNOSE\n"
-            f"Tests failed. Actual failure output:\n{test_failures[:3000]}\n\n"
+        diag = self.failure_analyzer.analyze(test_failures)
+        self.context.add_observation(
+            f"Diagnosis: {diag.category.value} - {diag.hypothesis}",
+            trust=TrustLevel.MODEL_INFERRED,
+        )
+
+        prompt = self.context_builder.build_phase_prompt(
+            self.context, "DIAGNOSE", task
+        )
+        prompt += (
+            f"\n\nTests failed. Actual failure output:\n{test_failures[:3000]}\n\n"
+            f"Automated classification: {diag.category.value}\n"
+            f"Hypothesis: {diag.hypothesis}\n\n"
             f"Analyze the failure. Identify the root cause, failing tests, "
             f"and relevant files. Do not make changes yet."
         )
         response = self._run_agent_step(prompt)
         diagnoses.append(response[:500])
+        self.context.record_diagnosis(response[:500])
         return self._advance(TaskPhase.DIAGNOSE, TaskPhase.FIX, phase_history)
 
     def _phase_fix(
@@ -340,25 +491,30 @@ class Orchestrator:
         phase_history: list[str],
         fixes: list[str],
     ) -> TaskPhase:
+        self.context.transition_to("FIX")
         if self._review_feedback:
-            prompt = (
-                f"Task: {task}\n\n"
-                f"Phase: FIX (reviewer rejection)\n"
-                f"The reviewer rejected the implementation with the following feedback:\n"
-                f"{self._review_feedback}\n\n"
-                f"Fix the issues identified by the reviewer. "
-                f"Do not refactor unrelated code."
+            self.context.review_feedback = self._review_feedback
+            prompt = self.context_builder.build_phase_prompt(
+                self.context, "FIX (reviewer rejection)", task
+            )
+            prompt += (
+                "\n\nThe reviewer rejected the implementation with the feedback above. "
+                "Fix the issues identified by the reviewer. "
+                "Do not refactor unrelated code."
             )
         else:
-            prompt = (
-                f"Task: {task}\n\n"
-                f"Phase: FIX\n"
-                f"Apply the minimal fix based on your diagnosis. "
-                f"Do not refactor unrelated code."
+            prompt = self.context_builder.build_phase_prompt(
+                self.context, "FIX", task
+            )
+            prompt += (
+                "\n\nApply the minimal fix based on your diagnosis. "
+                "Do not refactor unrelated code."
             )
         response = self._run_agent_step(prompt)
         fixes.append(response[:500])
+        self.context.record_fix(response[:500])
         self._review_feedback = ""
+        self.context.review_feedback = ""
         return self._advance(TaskPhase.FIX, TaskPhase.RETEST, phase_history)
 
     def _phase_retest(
@@ -368,6 +524,7 @@ class Orchestrator:
         retry_count: int,
         max_retries: int,
     ) -> TaskPhase:
+        self.context.transition_to("RETEST")
         if retry_count >= max_retries:
             phase_history.append(TaskPhase.FAILED.value)
             return TaskPhase.FAILED
@@ -379,14 +536,21 @@ class Orchestrator:
             )
 
         result = test_tool.execute(args="-v")
+        self.budget.record_tool_call()
         self._record_test_execution(result)
         success = result.get("success", False)
 
         if success:
+            self.context.add_observation(
+                "Retest passed", trust=TrustLevel.TOOL_VERIFIED
+            )
             return self._advance(
                 TaskPhase.RETEST, TaskPhase.REVIEW, phase_history
             )
         else:
+            self.context.add_observation(
+                "Retest failed", trust=TrustLevel.TOOL_VERIFIED
+            )
             return self._advance(
                 TaskPhase.RETEST, TaskPhase.DIAGNOSE, phase_history
             )
@@ -394,6 +558,7 @@ class Orchestrator:
     def _phase_review(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
+        self.context.transition_to("REVIEW")
         if self._review_retry_count >= MAX_RETRY_CYCLES:
             phase_history.append(TaskPhase.FAILED.value)
             return TaskPhase.FAILED
@@ -412,6 +577,9 @@ class Orchestrator:
         self._last_review_result = review_result
 
         if review_result.approved:
+            self.context.add_observation(
+                "Review approved", trust=TrustLevel.TOOL_VERIFIED
+            )
             return self._advance(TaskPhase.REVIEW, TaskPhase.VALIDATE, phase_history)
         else:
             findings_text = "; ".join(
@@ -422,17 +590,43 @@ class Orchestrator:
                 f"Summary: {review_result.summary}\n"
                 f"Findings: {findings_text}"
             )
+            self.context.review_feedback = self._review_feedback
             self._review_retry_count += 1
             return self._advance(TaskPhase.REVIEW, TaskPhase.FIX, phase_history)
 
     def _phase_validate(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
+        self.context.transition_to("VALIDATE")
+        test_results = None
+        for ex in reversed(self._accumulated_executions):
+            if ex.tool_name == "run_tests" and isinstance(ex.result, dict):
+                test_results = ex.result
+                break
+
+        files_modified = []
+        for ex in self._accumulated_executions:
+            if ex.success and ex.tool_name in ("write_file", "edit_file"):
+                path = ex.arguments.get("path", "")
+                if path and path not in files_modified:
+                    files_modified.append(path)
+
+        validation = self.validator.validate_all(
+            test_results=test_results,
+            files_modified=files_modified,
+        )
+
+        self.context.add_observation(
+            f"Validation: {'passed' if validation.overall_passed else 'failed'}",
+            trust=TrustLevel.SYSTEM_DERIVED,
+        )
+
         return self._advance(TaskPhase.VALIDATE, TaskPhase.REPORT, phase_history)
 
     def _phase_report(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
+        self.context.transition_to("REPORT")
         return self._advance(TaskPhase.REPORT, TaskPhase.DONE, phase_history)
 
     def _advance(
@@ -469,9 +663,10 @@ class Orchestrator:
                 content_preview = str(ex.result)[:500] if ex.result else ""
                 changes_lines.append(f"Read {path}:\n{content_preview}")
 
-            elif ex.success and ex.tool_name == "write_file":
+            elif ex.success and ex.tool_name in ("write_file", "edit_file"):
                 path = ex.arguments.get("path", "")
-                changes_lines.append(f"Wrote {path}")
+                action = "Wrote" if ex.tool_name == "write_file" else "Edited"
+                changes_lines.append(f"{action} {path}")
 
             elif ex.success and ex.tool_name == "run_command":
                 cmd = ex.arguments.get("command", "")
@@ -486,11 +681,19 @@ class Orchestrator:
             elif ex.tool_name == "run_tests" and isinstance(ex.result, dict):
                 test_results_str = json.dumps(ex.result, indent=2, default=str)[:2000]
 
+        changes_text = "\n".join(changes_lines) if changes_lines else "No file changes recorded."
+        diff_text = "\n".join(diff_lines) if diff_lines else "No diff available."
+
+        review_context = self.context_builder.build_review_context(
+            self.context, task, changes_text, diff_text, test_results_str,
+        )
+
         return self.reviewer.review(
             task=task,
-            changes="\n".join(changes_lines) if changes_lines else "No file changes recorded.",
-            diff="\n".join(diff_lines) if diff_lines else "No diff available.",
+            changes=changes_text,
+            diff=diff_text,
             test_results=test_results_str,
+            context=review_context,
         )
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:

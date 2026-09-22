@@ -18,6 +18,7 @@ class Reviewer:
         changes: str = "",
         diff: str = "",
         test_results: str = "",
+        context: str = "",
     ) -> ReviewResult:
         prompt = REVIEW_PROMPT.format(
             task=task,
@@ -25,6 +26,9 @@ class Reviewer:
             diff=diff,
             test_results=test_results or "No tests were run.",
         )
+
+        if context:
+            prompt += f"\n\nAdditional context:\n{context}"
 
         messages = [{"role": "user", "content": prompt}]
 
