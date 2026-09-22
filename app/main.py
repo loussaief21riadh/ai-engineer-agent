@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.agent.orchestrator import Orchestrator
-from app.config import AGENT_MODE, PROJECT_ROOT, AgentMode
+from app.config import AGENT_MODE, MAX_RETRY_CYCLES, PROJECT_ROOT, AgentMode
 from app.models.schemas import TaskReport
 
 
@@ -26,6 +26,7 @@ def print_status(orchestrator: Orchestrator) -> None:
     print(f"\nProject: {PROJECT_ROOT}")
     print(f"Mode: {orchestrator.mode.value}")
     print(f"Tools: {', '.join(orchestrator.core.tools.keys())}")
+    print(f"Max retry cycles: {MAX_RETRY_CYCLES}")
     print()
 
 
@@ -74,6 +75,18 @@ def print_report(report: TaskReport) -> None:
                 print(f"    [{f.severity.value}] {f.category}: {f.description}")
                 if f.file:
                     print(f"      at {f.file}:{f.line}" if f.line else f"      at {f.file}")
+
+    print(f"\n--- Execution ---")
+    print(f"  Phase: {report.final_phase}")
+    print(f"  Iterations: {report.iteration_count}")
+    if report.retry_count > 0:
+        print(f"  Retries: {report.retry_count}")
+    if report.diagnoses:
+        print(f"  Diagnoses: {len(report.diagnoses)}")
+    if report.fixes:
+        print(f"  Fixes: {len(report.fixes)}")
+    if report.stop_reason != "completed":
+        print(f"  Stop reason: {report.stop_reason}")
 
     print()
 

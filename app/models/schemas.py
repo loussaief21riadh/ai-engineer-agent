@@ -73,3 +73,11 @@ class TaskReport(BaseModel):
     final_response: str
     steps_taken: int
     executions: list[ToolExecution] = Field(default_factory=list)
+
+    final_phase: str = "DONE"
+    phase_history: list[str] = Field(default_factory=list)
+    iteration_count: int = 0
+    retry_count: int = 0
+    diagnoses: list[str] = Field(default_factory=list)
+    fixes: list[str] = Field(default_factory=list)
+    stop_reason: str = "completed"

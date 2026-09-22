@@ -15,11 +15,6 @@ def mock_client():
     return MagicMock()
 
 
-@pytest.fixture
-def mock_reviewer():
-    return MagicMock()
-
-
 def _make_approved_review() -> ReviewResult:
     return ReviewResult(
         approved=True,
@@ -42,49 +37,66 @@ def _make_rejected_review() -> ReviewResult:
     )
 
 
+def _phase_responses(*contents: str) -> list[ChatResponse]:
+    return [ChatResponse(content=c) for c in contents]
+
+
+def _make_orch(mock_client, mode=AgentMode.READ_ONLY):
+    orch = Orchestrator(client=mock_client, mode=mode)
+    mock_test = MagicMock()
+    mock_test.execute.return_value = {
+        "success": True,
+        "result": {"exit_code": 0, "stdout": "All tests passed", "stderr": ""},
+    }
+    orch.core.tools["run_tests"] = mock_test
+    return orch
+
+
 class TestReviewerIntegration:
     def test_reviewer_called_during_run_task(self, mock_client):
-        agent_response = ChatResponse(content="Done.")
+        agent_responses = _phase_responses("Understood.", "Plan ready.", "Inspected.", "Implemented.")
         reviewer_response = ChatResponse(content=json.dumps({
             "approved": True, "findings": [], "summary": "LGTM",
         }))
-        mock_client.chat.side_effect = [agent_response, reviewer_response]
+        mock_client.chat.side_effect = agent_responses + [reviewer_response]
 
-        orch = Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+        orch = _make_orch(mock_client)
         report = orch.run_task("Do something")
 
-        assert mock_client.chat.call_count == 2
         assert report.review is not None
         assert report.review.approved is True
 
     def test_actual_executions_passed_to_reviewer(self, mock_client):
-        tool_call_response = ChatResponse(
+        understand = ChatResponse(content="Understood.")
+        plan = ChatResponse(content="Plan ready.")
+        inspect = ChatResponse(
             content="",
             tool_calls=[{"id": "1", "name": "run_command", "arguments": {"command": "echo hello"}}],
         )
-        final_response = ChatResponse(content="Ran command.")
+        inspect_result = ChatResponse(content="Ran command.")
+        implement = ChatResponse(content="Done.")
         reviewer_response = ChatResponse(content=json.dumps({
             "approved": True, "findings": [], "summary": "OK",
         }))
-        mock_client.chat.side_effect = [tool_call_response, final_response, reviewer_response]
+        mock_client.chat.side_effect = [understand, plan, inspect, inspect_result, implement, reviewer_response]
 
-        orch = Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+        orch = _make_orch(mock_client)
         report = orch.run_task("Run echo")
 
-        review_call = mock_client.chat.call_args_list[2]
+        review_call = mock_client.chat.call_args_list[-1]
         prompt_content = review_call[1]["messages"][0]["content"]
         assert "echo hello" in prompt_content
 
     def test_review_result_in_task_report(self, mock_client):
-        agent_response = ChatResponse(content="Finished.")
+        agent_responses = _phase_responses("Understood.", "Plan ready.", "Inspected.", "Implemented.")
         reviewer_response = ChatResponse(content=json.dumps({
             "approved": False,
             "findings": [{"severity": "critical", "category": "security", "description": "Exposed key"}],
             "summary": "Critical issues found.",
         }))
-        mock_client.chat.side_effect = [agent_response, reviewer_response]
+        mock_client.chat.side_effect = agent_responses + [reviewer_response]
 
-        orch = Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+        orch = _make_orch(mock_client)
         report = orch.run_task("Check security")
 
         assert report.review is not None
@@ -94,10 +106,10 @@ class TestReviewerIntegration:
         assert report.review.summary == "Critical issues found."
 
     def test_reviewer_failure_safe(self, mock_client):
-        agent_response = ChatResponse(content="Done.")
-        mock_client.chat.side_effect = [agent_response, OpenRouterError("Reviewer down")]
+        agent_responses = _phase_responses("Understood.", "Plan ready.", "Inspected.", "Done.")
+        mock_client.chat.side_effect = agent_responses + [OpenRouterError("Reviewer down")]
 
-        orch = Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+        orch = _make_orch(mock_client)
         report = orch.run_task("Do task")
 
         assert report.review is not None
@@ -107,23 +119,30 @@ class TestReviewerIntegration:
         assert report.steps_taken > 0
 
     def test_no_fabrication_reviewer_gets_real_data(self, mock_client):
-        tool_call_response = ChatResponse(
+        understand = ChatResponse(content="Understood.")
+        plan = ChatResponse(content="Plan ready.")
+        inspect = ChatResponse(content="Inspected.")
+        implement = ChatResponse(
             content="",
-            tool_calls=[{"id": "1", "name": "write_file", "arguments": {"path": "test.py", "content": "x=1"}}],
+            tool_calls=[{"id": "1", "name": "write_file", "arguments": {"path": "output.py", "content": "x=1"}}],
         )
-        final_response = ChatResponse(content="Wrote file.")
+        implement_result = ChatResponse(content="Wrote file.")
         reviewer_response = ChatResponse(content=json.dumps({
             "approved": True, "findings": [], "summary": "OK",
         }))
-        mock_client.chat.side_effect = [tool_call_response, final_response, reviewer_response]
+        mock_client.chat.side_effect = [understand, plan, inspect, implement, implement_result, reviewer_response]
 
-        orch = Orchestrator(client=mock_client, mode=AgentMode.ALLOW_EDITS)
-        report = orch.run_task("Create test.py")
+        orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        real_write_tool = orch.core.tools["write_file"]
+        real_write_tool.execute = MagicMock(
+            return_value={"success": True, "result": "Wrote 3 bytes to output.py"}
+        )
+        report = orch.run_task("Create output.py")
 
-        review_call = mock_client.chat.call_args_list[2]
+        review_call = mock_client.chat.call_args_list[-1]
         prompt = review_call[1]["messages"][0]["content"]
-        assert "test.py" in prompt
-        assert "write_file" in prompt.lower() or "Wrote" in prompt or "wrote" in prompt
+        assert "output.py" in prompt
+        assert "Wrote" in prompt or "wrote" in prompt
         assert report.review is not None
 
     def test_cli_print_report_shows_review(self, mock_client, capsys):

@@ -278,12 +278,22 @@ class TestExecutionTracking:
 
 
 class TestAntiFabrication:
+    def _make_orch(self, mock_client):
+        orch = Orchestrator(client=mock_client)
+        mock_test = MagicMock()
+        mock_test.execute.return_value = {
+            "success": True,
+            "result": {"exit_code": 0, "stdout": "All tests passed", "stderr": ""},
+        }
+        orch.core.tools["run_tests"] = mock_test
+        return orch
+
     def test_fabricated_claim_not_in_report(self):
         mock_client = MagicMock()
         final_resp = ChatResponse(content="I read app/main.py and it looks fine.")
         mock_client.chat.return_value = final_resp
 
-        orch = Orchestrator(client=mock_client)
+        orch = self._make_orch(mock_client)
         report = orch.run_task("review app/main.py")
 
         assert report.files_inspected == []
@@ -293,7 +303,7 @@ class TestAntiFabrication:
         final_resp = ChatResponse(content="I wrote file.py with the new code.")
         mock_client.chat.return_value = final_resp
 
-        orch = Orchestrator(client=mock_client)
+        orch = self._make_orch(mock_client)
         report = orch.run_task("write file.py")
 
         assert report.files_modified == []
