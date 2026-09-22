@@ -19,6 +19,8 @@ def print_help() -> None:
     print("  /mode    - Change execution mode")
     print("  /plan    - Show current plan")
     print("  /context - Show current context summary")
+    print("  /budget  - Show budget usage and limits")
+    print("  /history - Show task history from memory")
     print("  /clear   - Clear conversation history")
     print("  /exit    - Exit the agent")
     print()
@@ -190,6 +192,58 @@ def main() -> None:
             orchestrator.core.history.clear()
             orchestrator.core.executions.clear()
             print("\nConversation cleared.\n")
+            continue
+
+        if user_input == "/budget":
+            budget = orchestrator.budget.status()
+            print(f"\n--- Budget ---")
+            print(f"LLM calls:   {budget['llm_calls']}/{budget['max_llm_calls']}")
+            print(f"Tool calls:  {budget['tool_calls']}/{budget['max_tool_calls']}")
+            print(f"Retries:     {budget['retries']}/{budget['max_retries']}")
+            within = "YES" if budget['within_budget'] else "NO"
+            print(f"Within budget: {within}")
+            if budget.get('budget_violation'):
+                print(f"Violation: {budget['budget_violation']}")
+            print()
+            continue
+
+        if user_input == "/history":
+            memory = orchestrator.memory
+            print(f"\n--- Project Memory ---")
+            if memory.important_files:
+                print(f"Important files: {len(memory.important_files)}")
+                for path, desc in list(memory.important_files.items())[:5]:
+                    print(f"  {path}: {desc[:60]}")
+            if memory.architecture_notes:
+                print(f"Architecture notes: {len(memory.architecture_notes)}")
+                for note in memory.architecture_notes[-3:]:
+                    print(f"  - {note[:80]}")
+            if memory.known_commands:
+                print(f"Known commands: {len(memory.known_commands)}")
+            if memory.known_test_commands:
+                print(f"Test commands: {memory.known_test_commands}")
+            if memory.important_decisions:
+                print(f"Decisions: {len(memory.important_decisions)}")
+                for dec in memory.important_decisions[-3:]:
+                    print(f"  - {dec[:80]}")
+            if memory.previous_failures:
+                print(f"Previous failures: {len(memory.previous_failures)}")
+                for fail in memory.previous_failures[-3:]:
+                    print(f"  - {fail[:80]}")
+            if memory.successful_fixes:
+                print(f"Successful fixes: {len(memory.successful_fixes)}")
+                for fix in memory.successful_fixes[-3:]:
+                    print(f"  - {fix[:80]}")
+            if memory.project_conventions:
+                print(f"Conventions: {len(memory.project_conventions)}")
+                for conv in memory.project_conventions[-3:]:
+                    print(f"  - {conv[:80]}")
+            if not any([memory.important_files, memory.architecture_notes,
+                       memory.known_commands, memory.known_test_commands,
+                       memory.important_decisions, memory.previous_failures,
+                       memory.successful_fixes, memory.project_conventions]):
+                print("  No entries yet.")
+            print()
             continue
 
         try:

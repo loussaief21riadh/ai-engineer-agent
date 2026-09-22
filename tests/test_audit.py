@@ -479,7 +479,7 @@ class TestTaskReport:
             executions=list(core.executions),
         )
         assert report.test_results is not None
-        assert report.test_results["exit_code"] == 0
+        assert report.test_results.get("exit_code", report.test_results.get("result", {}).get("exit_code")) == 0
 
     def test_report_no_duplicates(self):
         mock_client = MagicMock()

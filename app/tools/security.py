@@ -58,3 +58,29 @@ def is_secret_path(target: Path, project_root: Path) -> bool:
 
 def contains_shell_metacharacters(command: str) -> bool:
     return bool(_SHELL_META_RE.search(command))
+
+
+def safe_path(path: str, project_root: Path | None = None) -> Path:
+    """Resolve a path and ensure it stays within project root and is not a secret."""
+    from app.config import PROJECT_ROOT
+    root = project_root if project_root is not None else PROJECT_ROOT
+    requested = Path(path)
+
+    if requested.is_absolute():
+        target = requested.resolve()
+    else:
+        target = (root / requested).resolve()
+
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise PermissionError(
+            f"Access denied: '{path}' resolves outside project root."
+        )
+
+    if is_secret_path(target, root):
+        raise PermissionError(
+            "Access denied: file is a protected secret."
+        )
+
+    return target

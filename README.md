@@ -7,6 +7,7 @@ A lightweight, local AI engineering agent that uses OpenRouter API to assist wit
 - **V1.0**: Core agent loop, tool system, CLI, reviewer, security hardening, 270 tests
 - **V1.5**: State machine (`TaskPhase`), retry/recovery logic, anti-fabrication, 301 tests
 - **V2.0**: Context engine, structured planning with validation, diagnostics, edit tool, budget enforcement, 569 tests
+- **V2.1**: Model routing, persistent project memory, trust-level evidence, security check phase, validation blocking, 608 tests
 
 ## Architecture
 
@@ -23,33 +24,37 @@ User → CLI → Orchestrator → AgentCore → OpenRouter → Model
                                     Final response → TaskReport
 ```
 
-### V2.0 Orchestrator Flow
+### V2.1 Orchestrator Flow
 
 ```
-UNDERSTAND → PLAN → INSPECT → IMPLEMENT → TEST
-                                              ↓
-                              TEST pass → REVIEW → VALIDATE → REPORT → DONE
-                              TEST fail → DIAGNOSE → FIX → RETEST (loop)
-                              REVIEW reject → FIX → RETEST → REVIEW
+UNDERSTAND → PLAN → INSPECT → IMPLEMENT → TEST → SECURITY_CHECK
+                                                      ↓
+                                    TEST pass → SECURITY_CHECK → REVIEW → VALIDATE → REPORT → DONE
+                                    TEST fail → DIAGNOSE → FIX → RETEST (loop)
+                                    REVIEW reject → FIX → RETEST → REVIEW
+                                    VALIDATION fail → FAILED
 ```
 
 ### Key Components
 
 | Module | Purpose |
 |---|---|
-| `app/main.py` | CLI interface |
+| `app/main.py` | CLI interface with /budget, /history commands |
 | `app/config.py` | Configuration via env vars |
 | `app/agent/core.py` | Agent loop, tool dispatch, message management |
 | `app/agent/orchestrator.py` | Phase state machine, tool registration, mode management, report building |
 | `app/agent/context.py` | TaskContext, ContextBuilder, TrustLevel (5 levels), bounded collections |
 | `app/agent/planner.py` | TaskPlan, Subtask, PlanValidator (Pydantic-based deterministic validation) |
-| `app/agent/diagnostics.py` | FailureAnalyzer, 13 error categories, pattern-based classification |
-| `app/agent/validator.py` | Validator, ValidationReport (test results, expected files, execution success) |
+| `app/agent/diagnostics.py` | FailureAnalyzer, 13 error categories, pattern-based classification, suggested fixes |
+| `app/agent/validator.py` | Validator, ValidationReport (blocks on failure, excludes expected security rejections) |
 | `app/agent/prompts.py` | System and review prompts (with trust boundary instructions) |
-| `app/agent/reviewer.py` | Independent code review component (receives enriched context) |
+| `app/agent/reviewer.py` | Independent code review (NEEDS_MORE_EVIDENCE verdict, trust-level evidence) |
+| `app/agent/router.py` | ModelRouter, task classification (DEBUGGING, CODING, REVIEW, etc.) |
+| `app/agent/memory.py` | ProjectMemory with JSON persistence across sessions |
 | `app/agent/quota.py` | BudgetTracker, BudgetLimits (LLM calls, tool calls, retry cycles, duration) |
+| `app/agent/phases.py` | TaskPhase enum with SECURITY_CHECK phase |
 | `app/llm/openrouter.py` | OpenRouter client with ChatResponse |
-| `app/models/schemas.py` | Pydantic models (ToolCall, ToolExecution, TaskReport, etc.) |
+| `app/models/schemas.py` | Pydantic models (ToolCall, ToolExecution, ExecutionEvidence, TaskReport, ReviewVerdict) |
 | `app/tools/base.py` | BaseTool, ToolSchema, argument validation |
 | `app/tools/filesystem.py` | ListFilesTool, ReadFileTool, WriteFileTool |
 | `app/tools/terminal.py` | RunCommandTool with allowlist |
@@ -57,7 +62,7 @@ UNDERSTAND → PLAN → INSPECT → IMPLEMENT → TEST
 | `app/tools/edit.py` | EditFileTool (exact-match text replacement) |
 | `app/tools/git.py` | GitStatusTool, GitDiffTool (read-only) |
 | `app/tools/env.py` | Environment discovery and project-local executable resolution |
-| `app/tools/security.py` | Secret protection, shell metacharacter blocking |
+| `app/tools/security.py` | Centralized security: `safe_path()`, secret protection, shell metacharacter blocking |
 
 ## Context Engine
 
@@ -72,7 +77,7 @@ UNDERSTAND → PLAN → INSPECT → IMPLEMENT → TEST
 - **decisions**: Decision records (bounded to 20)
 - **plan**: Validated structured plan (when LLM produces valid JSON)
 
-`ContextBuilder` generates phase-specific prompts from accumulated context.
+`ContextBuilder` generates phase-specific prompts from accumulated context, including trust-level annotations on observations.
 
 ### Trust Levels
 
@@ -84,7 +89,7 @@ UNDERSTAND → PLAN → INSPECT → IMPLEMENT → TEST
 | `MODEL_PROPOSED` | LLM claim (not verified) | "I fixed the bug" |
 | `MODEL_INFERRED` | LLM inference | Diagnosis hypothesis, classification |
 
-Model claims never silently become tool-verified evidence.
+Trust levels are surfaced in phase prompts and review context. Model claims never silently become tool-verified evidence.
 
 ## Structured Planning
 
@@ -104,17 +109,59 @@ If the LLM produces valid structured JSON, the validated plan is stored in `Task
 
 SYNTAX_ERROR, TYPE_ERROR, IMPORT_ERROR, TEST_FAILURE, LOGIC_ERROR, CONFIGURATION_ERROR, DEPENDENCY_ERROR, ENVIRONMENT_ERROR, PERMISSION_ERROR, TIMEOUT, TOOL_ERROR, LLM_ERROR, UNKNOWN
 
-Pattern-based classification generates hypotheses labeled as `MODEL_INFERRED`.
+Pattern-based classification generates hypotheses and suggested fixes labeled as `MODEL_INFERRED`.
 
 ## Validation
 
-`Validator` performs minimal programmatic checks:
+`Validator` performs programmatic checks and **blocks on failure**:
 
-- Test exit code (0 = pass)
+- Test exit code (0 = pass, handles nested result format)
 - Expected files present in modified list
-- Execution success (no failed tool calls)
+- Execution success (excludes expected security rejections like blocked commands)
+- Security rejections (unknown executable, blocked git subcommand) are excluded from failure count
 
 The reviewer LLM remains the primary quality gate.
+
+## Security Check Phase
+
+After tests pass, a `SECURITY_CHECK` phase runs before review:
+
+- Scans modified files for suspicious patterns (network fetches, dynamic code execution, potential secrets)
+- Checks executed commands for suspicious operations
+- Trust-level labeled observations fed to reviewer
+
+## Reviewer
+
+The `Reviewer` component performs independent code review:
+
+- Receives enriched context: task, plan, changes, diff, test results, diagnoses, fixes, trust-level evidence
+- Three verdicts: `APPROVE`, `REJECT`, `NEEDS_MORE_EVIDENCE`
+- `NEEDS_MORE_EVIDENCE` triggers additional inspection before re-review
+- Separate LLM call with dedicated review prompt (curly-brace safe)
+- Rejection triggers FIX → RETEST → REVIEW recovery loop
+- Reviewer does not have access to tools
+
+## Model Routing
+
+`ModelRouter` classifies tasks by complexity and selects appropriate models:
+
+| Category | Keywords |
+|---|---|
+| DEBUGGING | debug, fix, error, bug, fail, broken, crash |
+| CODING | implement, write, create, add, build, develop, code |
+| REVIEW | review, audit, check, inspect, analyze, assess |
+| PLANNING | plan, design, architect, structure, organize |
+| REASONING | explain, why, how, reason, compare, evaluate |
+| SIMPLE | (default) |
+
+## Project Memory
+
+`ProjectMemory` persists structured knowledge across sessions:
+
+- Important files, architecture notes, known commands
+- Previous failures, successful fixes, project conventions
+- Stored in `.opencode/memory.json`
+- Loaded on orchestrator init, saved after each task
 
 ## Edit Tool
 
@@ -130,24 +177,16 @@ The reviewer LLM remains the primary quality gate.
 ## Autonomous Recovery Loop
 
 ```
-TEST fail → DIAGNOSE → FIX → RETEST → TEST pass → REVIEW
-                                         RETEST fail → DIAGNOSE (loop)
-                                  REVIEW reject → FIX → RETEST → REVIEW
+TEST fail → DIAGNOSE → FIX → RETEST → TEST pass → SECURITY_CHECK → REVIEW
+                                          RETEST fail → DIAGNOSE (loop, bounded by MAX_RETRY_CYCLES)
+                                   REVIEW reject → FIX → RETEST → REVIEW
+                                   REVIEW needs_more_evidence → INSPECT → REVIEW
+                                   VALIDATION fail → FAILED
 ```
 
 - Bounded by `MAX_RETRY_CYCLES` (default: 3)
 - Bounded by `MAX_ITERATIONS` (default: 50)
 - Bounded by budget limits
-
-## Reviewer
-
-The `Reviewer` component performs independent code review:
-
-- Receives enriched context: task, plan, changes, diff, test results, diagnoses, fixes
-- Separate LLM call with dedicated review prompt
-- Returns structured `ReviewResult` (approved, findings, summary)
-- Rejection triggers FIX → RETEST → REVIEW recovery loop
-- Reviewer does not have access to tools
 
 ## Anti-Fabrication / Execution Evidence
 
@@ -156,7 +195,7 @@ The `Reviewer` component performs independent code review:
 - `files_modified` only includes paths from successful `write_file`/`edit_file` executions
 - `files_inspected` only includes paths from successful `read_file` executions
 - Model claims ("I modified main.py") without tool execution produce no entries
-- Trust levels distinguish tool-verified from model-proposed
+- `ExecutionEvidence` provides structured provenance with trust levels
 
 ## Budget Enforcement
 
@@ -182,6 +221,7 @@ Actual LLM API requests are counted at the `AgentCore._call_llm` boundary (one c
 - **API key protection**: Never exposed in errors, logs, or reports
 - **Edit tool protection**: Exact-match, path traversal, secret blocking, mode gating
 - **Prompt injection hardening**: System prompt explicitly marks repository contents as untrusted data
+- **Review prompt safety**: String concatenation instead of `.format()` to prevent KeyError from curly braces in interpolated values
 
 ## Agent Modes
 
@@ -205,6 +245,8 @@ Commands:
 - `/mode` — Change execution mode
 - `/plan` — Show current task plan
 - `/context` — Show current task context
+- `/budget` — Show budget usage and limits
+- `/history` — Show project memory (previous tasks, fixes, conventions)
 - `/clear` — Clear conversation history
 - `/exit` — Exit the agent
 
@@ -216,6 +258,7 @@ Create a `.env` file:
 OPENROUTER_API_KEY=your_key_here
 PRIMARY_MODEL=openrouter/free
 REVIEWER_MODEL=openrouter/free
+FALLBACK_MODEL=openrouter/free
 PROJECT_ROOT=.
 AGENT_MODE=READ_ONLY
 MAX_AGENT_STEPS=15
@@ -231,9 +274,10 @@ MAX_TASK_DURATION=600
 .venv/bin/python -m pytest tests/ -v
 ```
 
-**569 tests** covering:
+**608 tests** covering:
 - V1.5 regression (301+ tests)
 - V2.0 context engine, planning, diagnostics, validation, edit tool (185+ tests)
+- V2.1 security check, memory persistence, model routing, reviewer verdicts, trust evidence (39 tests)
 - Security: terminal, filesystem, edit tool, prompt injection, anti-fabrication (109 tests)
 - E2E integration (30+ tests)
 
@@ -248,7 +292,6 @@ MAX_TASK_DURATION=600
 - Models without native tool calling use text fallback
 - Plan validation is deterministic but plan generation relies on LLM
 - Budget is local enforcement only (does not query OpenRouter quota)
-- Project memory (`app/agent/memory.py`) is experimental/session-only — not persisted across CLI restarts
-- Model routing (`app/agent/router.py`) is experimental — keyword-based classification, not currently integrated into orchestrator
+- Model routing uses keyword-based classification (not LLM-based)
 - Prompt injection protection is defense-in-depth, not guaranteed immunity
 - No OS-level sandboxing beyond the tool allowlist

@@ -11,6 +11,7 @@ class TaskPhase(str, Enum):
     INSPECT = "INSPECT"
     IMPLEMENT = "IMPLEMENT"
     TEST = "TEST"
+    SECURITY_CHECK = "SECURITY_CHECK"
     DIAGNOSE = "DIAGNOSE"
     FIX = "FIX"
     RETEST = "RETEST"
@@ -26,7 +27,8 @@ VALID_TRANSITIONS: dict[TaskPhase, list[TaskPhase]] = {
     TaskPhase.PLAN: [TaskPhase.INSPECT, TaskPhase.FAILED],
     TaskPhase.INSPECT: [TaskPhase.IMPLEMENT, TaskPhase.TEST, TaskPhase.FAILED],
     TaskPhase.IMPLEMENT: [TaskPhase.TEST, TaskPhase.FAILED],
-    TaskPhase.TEST: [TaskPhase.REVIEW, TaskPhase.DIAGNOSE, TaskPhase.DONE, TaskPhase.FAILED],
+    TaskPhase.TEST: [TaskPhase.SECURITY_CHECK, TaskPhase.REVIEW, TaskPhase.DIAGNOSE, TaskPhase.DONE, TaskPhase.FAILED],
+    TaskPhase.SECURITY_CHECK: [TaskPhase.REVIEW, TaskPhase.DIAGNOSE, TaskPhase.FAILED],
     TaskPhase.DIAGNOSE: [TaskPhase.FIX, TaskPhase.FAILED],
     TaskPhase.FIX: [TaskPhase.RETEST, TaskPhase.FAILED],
     TaskPhase.RETEST: [TaskPhase.TEST, TaskPhase.DIAGNOSE, TaskPhase.REVIEW, TaskPhase.FAILED],

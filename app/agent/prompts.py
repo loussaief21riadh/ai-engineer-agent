@@ -47,25 +47,10 @@ Review the following changes for:
 - Architectural issues
 - Incorrect assumptions
 
-Original task: {task}
-
-Changes made:
-{changes}
-
-Git diff:
-{diff}
-
-Test results:
-{test_results}
-
-Provide a structured review with:
-1. Whether the changes are approved (true/false)
-2. A list of findings, each with severity (info/warning/error/critical), category, description, and optional file/line
-3. A brief summary
-
 Respond in this exact JSON format:
 {{
   "approved": true/false,
+  "verdict": "APPROVE" or "REJECT" or "NEEDS_MORE_EVIDENCE",
   "findings": [
     {{
       "severity": "info|warning|error|critical",
@@ -77,4 +62,6 @@ Respond in this exact JSON format:
   ],
   "summary": "..."
 }}
+
+IMPORTANT: If the evidence provided is insufficient to make a confident judgment, use verdict "NEEDS_MORE_EVIDENCE" and explain what additional evidence would be needed.
 """

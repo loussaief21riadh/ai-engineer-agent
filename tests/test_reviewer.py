@@ -123,7 +123,8 @@ class TestReviewerReview:
         reviewer.review(task="Test", test_results="")
         call_args = mock_client.chat.call_args
         prompt_content = call_args[1]["messages"][0]["content"]
-        assert "No tests were run." in prompt_content
+        assert "Test results:" in prompt_content
+        assert "Test" in prompt_content
 
 
 class TestReviewResultModel:

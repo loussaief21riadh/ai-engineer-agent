@@ -1,10 +1,15 @@
-"""Project memory for V2.0 — structured local knowledge retention."""
+"""Project memory for V2.0 — structured local knowledge retention with persistence."""
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from app.config import PROJECT_ROOT
 
 
 class MemoryEntry(BaseModel):
@@ -133,3 +138,25 @@ class ProjectMemory(BaseModel):
             project_conventions=data.get("project_conventions", []),
             entries=entries,
         )
+
+    def save(self, path: str | Path | None = None) -> None:
+        if path is None:
+            path = PROJECT_ROOT / ".opencode" / "memory.json"
+        else:
+            path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2, default=str))
+
+    @classmethod
+    def load(cls, path: str | Path | None = None) -> ProjectMemory:
+        if path is None:
+            path = PROJECT_ROOT / ".opencode" / "memory.json"
+        else:
+            path = Path(path)
+        if not path.exists():
+            return cls()
+        try:
+            data = json.loads(path.read_text())
+            return cls.from_dict(data)
+        except (json.JSONDecodeError, KeyError):
+            return cls()

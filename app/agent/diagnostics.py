@@ -121,6 +121,16 @@ class FailureAnalyzer:
             "directory",
             "ENOENT",
         ],
+        ErrorCategory.LOGIC_ERROR: [
+            "IndexError",
+            "KeyError",
+            "AttributeError",
+            "ValueError",
+            "RuntimeError",
+            "RecursionError",
+            "infinite loop",
+            "stack overflow",
+        ],
     }
 
     def classify(self, output: str) -> ErrorCategory:
@@ -155,6 +165,7 @@ class FailureAnalyzer:
         evidence = "\n".join(evidence_lines) if evidence_lines else combined[:500]
 
         hypothesis = self._generate_hypothesis(category, combined)
+        suggested_fix = self._generate_suggested_fix(category, combined)
 
         return FailureDiagnosis(
             failure=combined[:1000],
@@ -162,7 +173,7 @@ class FailureAnalyzer:
             category=category,
             hypothesis=hypothesis,
             confidence=0.5 if category != ErrorCategory.UNKNOWN else 0.2,
-            suggested_fix="",
+            suggested_fix=suggested_fix,
         )
 
     def _generate_hypothesis(self, category: ErrorCategory, output: str) -> str:
@@ -188,4 +199,33 @@ class FailureAnalyzer:
             return "Configuration issue. Check environment variables and config files."
         elif category == ErrorCategory.ENVIRONMENT_ERROR:
             return "File or directory not found. Verify path exists and is correct."
+        elif category == ErrorCategory.LOGIC_ERROR:
+            return "Runtime logic error. Check for incorrect indexing, missing keys, or None attribute access."
         return "Unable to determine root cause from output. Manual inspection may be needed."
+
+    def _generate_suggested_fix(self, category: ErrorCategory, output: str) -> str:
+        if category == ErrorCategory.SYNTAX_ERROR:
+            return "Fix syntax: check colons, parentheses, indentation, and string quoting."
+        elif category == ErrorCategory.TYPE_ERROR:
+            return "Fix types: add type checks, handle None, verify function signatures."
+        elif category == ErrorCategory.IMPORT_ERROR:
+            return "Fix import: add missing dependency or correct module name."
+        elif category == ErrorCategory.TEST_FAILURE:
+            return "Fix assertion: compare expected vs actual, update test or implementation."
+        elif category == ErrorCategory.PERMISSION_ERROR:
+            return "Fix permissions: check file ownership or run with appropriate user."
+        elif category == ErrorCategory.TIMEOUT:
+            return "Fix timeout: optimize loops, reduce computation, or increase timeout."
+        elif category == ErrorCategory.TOOL_ERROR:
+            return "Fix tool: verify arguments match tool schema."
+        elif category == ErrorCategory.LLM_ERROR:
+            return "Fix LLM: check API key, wait for rate limit, or use fallback model."
+        elif category == ErrorCategory.DEPENDENCY_ERROR:
+            return "Fix dependency: pip install the missing package."
+        elif category == ErrorCategory.CONFIGURATION_ERROR:
+            return "Fix config: set required environment variables in .env."
+        elif category == ErrorCategory.ENVIRONMENT_ERROR:
+            return "Fix path: verify file/directory exists before accessing."
+        elif category == ErrorCategory.LOGIC_ERROR:
+            return "Fix logic: add bounds checking, handle edge cases, validate inputs."
+        return "Review error output and trace to the originating code."

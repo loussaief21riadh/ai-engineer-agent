@@ -65,10 +65,15 @@ class Validator:
         exit_code = test_results.get("exit_code", -1)
         success = test_results.get("success", False)
 
+        if exit_code == -1 and isinstance(test_results.get("result"), dict):
+            exit_code = test_results["result"].get("exit_code", -1)
+
         passed = exit_code == 0 and success
         details = f"exit_code={exit_code}, success={success}"
 
         stdout = test_results.get("stdout", "")
+        if not stdout and isinstance(test_results.get("result"), dict):
+            stdout = test_results["result"].get("stdout", "")
         evidence = stdout[-500:] if stdout else ""
 
         return ValidationResult(
@@ -95,11 +100,20 @@ class Validator:
             details=details,
         )
 
+    BLOCKED_PATTERNS = ["not allowed", "blocked git", "unknown executable", "shell metacharacters"]
+
     def validate_execution_success(
         self,
         executions: list[dict[str, Any]],
     ) -> ValidationResult:
-        failures = [ex for ex in executions if not ex.get("success", False)]
+        failures = []
+        for ex in executions:
+            if ex.get("success", False):
+                continue
+            error = (ex.get("error") or "").lower()
+            if any(pat in error for pat in self.BLOCKED_PATTERNS):
+                continue
+            failures.append(ex)
         passed = len(failures) == 0
 
         failure_details = []

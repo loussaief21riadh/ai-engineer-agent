@@ -231,7 +231,7 @@ class TestAntiFabrication:
             ChatResponse(content="Done."),
         ]
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -289,7 +289,7 @@ class TestModeRestrictions:
             ChatResponse(content="Cannot write."),
         ]
         reviewer = ChatResponse(content=json.dumps({
-            "approved": False, "findings": [], "summary": "Rejected.",
+            "approved": False, "verdict": "REJECT", "findings": [], "summary": "Rejected.",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 

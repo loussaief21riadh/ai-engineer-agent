@@ -9,26 +9,8 @@ from app.tools.security import is_secret_path
 
 
 def _safe_path(path: str) -> Path:
-    requested = Path(path)
-
-    if requested.is_absolute():
-        target = requested.resolve()
-    else:
-        target = (PROJECT_ROOT / requested).resolve()
-
-    try:
-        target.relative_to(PROJECT_ROOT)
-    except ValueError:
-        raise PermissionError(
-            f"Access denied: '{path}' resolves outside project root."
-        )
-
-    if is_secret_path(target, PROJECT_ROOT):
-        raise PermissionError(
-            "Access denied: file is a protected secret."
-        )
-
-    return target
+    from app.tools.security import safe_path
+    return safe_path(path, PROJECT_ROOT)
 
 
 class ListFilesTool(BaseTool):

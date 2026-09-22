@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from enum import Enum
 from typing import Any
 
@@ -31,6 +32,36 @@ class ToolExecution(BaseModel):
     tool_call_id: str = ""
 
 
+class ExecutionEvidence(BaseModel):
+    """Structured evidence from a single tool execution."""
+    tool: str
+    command: str = ""
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timestamp: float = Field(default_factory=time.time)
+    exit_code: int | None = None
+    success: bool = False
+    stdout_summary: str = ""
+    stderr_summary: str = ""
+    trust_level: str = "TOOL_VERIFIED"
+    duration_ms: float | None = None
+
+    @classmethod
+    def from_tool_execution(cls, ex: ToolExecution) -> ExecutionEvidence:
+        result_data = ex.result if isinstance(ex.result, dict) else {}
+        return cls(
+            tool=ex.tool_name,
+            command=ex.arguments.get("command", ""),
+            arguments=ex.arguments,
+            timestamp=time.time(),
+            exit_code=result_data.get("exit_code"),
+            success=ex.success,
+            stdout_summary=str(result_data.get("stdout", ""))[:500],
+            stderr_summary=str(result_data.get("stderr", ex.error or ""))[:500],
+            trust_level="TOOL_VERIFIED",
+            duration_ms=ex.duration_ms,
+        )
+
+
 class AgentMessage(BaseModel):
     role: str
     content: str
@@ -48,6 +79,12 @@ class ReviewSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class ReviewVerdict(str, Enum):
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    NEEDS_MORE_EVIDENCE = "NEEDS_MORE_EVIDENCE"
+
+
 class ReviewFinding(BaseModel):
     severity: ReviewSeverity
     category: str
@@ -58,6 +95,7 @@ class ReviewFinding(BaseModel):
 
 class ReviewResult(BaseModel):
     approved: bool
+    verdict: ReviewVerdict = ReviewVerdict.APPROVE
     findings: list[ReviewFinding] = Field(default_factory=list)
     summary: str = ""
 

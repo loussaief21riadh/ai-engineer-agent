@@ -140,6 +140,14 @@ class ContextBuilder:
             recent_failures = ctx.failures[-self.MAX_FAILURES:]
             parts.append(f"\nRecent failures:\n" + "\n".join(f"- {f}" for f in recent_failures))
 
+        if ctx.observations:
+            recent_obs = ctx.observations[-self.MAX_OBSERVATIONS:]
+            obs_lines = []
+            for obs in recent_obs:
+                trust_tag = f"[{obs.trust.value}]" if obs.trust else ""
+                obs_lines.append(f"  {trust_tag} {obs.content}")
+            parts.append(f"\nKey observations:\n" + "\n".join(obs_lines))
+
         if ctx.diagnoses:
             recent_diagnoses = ctx.diagnoses[-self.MAX_DIAGNOSES:]
             parts.append(f"\nPrevious diagnoses:\n" + "\n".join(f"- {d}" for d in recent_diagnoses))
@@ -175,6 +183,13 @@ class ContextBuilder:
 
         if test_results:
             parts.append(f"\nTest results:\n{test_results}")
+
+        if ctx.observations:
+            evidence_lines = []
+            for obs in ctx.observations[-15:]:
+                trust_tag = f"[{obs.trust.value}]" if obs.trust else "[UNKNOWN]"
+                evidence_lines.append(f"  {trust_tag} {obs.content}")
+            parts.append(f"\nExecution evidence (with provenance):\n" + "\n".join(evidence_lines))
 
         if ctx.diagnoses:
             parts.append(f"\nDiagnoses:\n" + "\n".join(f"- {d}" for d in ctx.diagnoses[-3:]))

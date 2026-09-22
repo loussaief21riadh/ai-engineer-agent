@@ -6,10 +6,12 @@ from typing import Any
 from app.agent.context import ContextBuilder, TaskContext, TrustLevel
 from app.agent.core import AgentCore
 from app.agent.diagnostics import FailureAnalyzer
+from app.agent.memory import ProjectMemory
 from app.agent.phases import TaskPhase, can_transition
-from app.agent.planner import PlanValidator
+from app.agent.planner import PlanValidator, SubtaskStatus, TaskPlan
 from app.agent.quota import BudgetTracker
 from app.agent.reviewer import Reviewer
+from app.agent.router import ModelRouter, TaskCategory
 from app.agent.validator import Validator
 from app.config import AGENT_MODE, MAX_RETRY_CYCLES, AgentMode
 from app.llm.openrouter import OpenRouterClient
@@ -70,7 +72,10 @@ def _build_report_from_executions(
 
         elif ex.tool_name == "run_tests":
             if isinstance(ex.result, dict):
-                test_results = ex.result
+                if "success" in ex.result:
+                    test_results = ex.result
+                else:
+                    test_results = {"success": ex.success, "result": ex.result}
 
         elif ex.tool_name in ("git_status", "git_diff"):
             label = f"{ex.tool_name}"
@@ -112,6 +117,8 @@ class Orchestrator:
         self.failure_analyzer = FailureAnalyzer()
         self.validator = Validator()
         self.budget = BudgetTracker()
+        self.router = ModelRouter()
+        self.memory = ProjectMemory.load()
 
         self.core = AgentCore(client=self.client, on_llm_call=self.budget.record_llm_call)
         self.reviewer = Reviewer(client=self.client)
@@ -121,6 +128,9 @@ class Orchestrator:
         self._review_feedback: str = ""
         self._plan_validated = False
         self._plan_rejected = False
+        self._task_plan: TaskPlan | None = None
+        self._current_subtask_index: int = 0
+        self._execution_hashes: list[str] = []
 
         self._register_default_tools()
 
@@ -165,6 +175,15 @@ class Orchestrator:
         self.budget.start()
         self._plan_validated = False
         self._plan_rejected = False
+        self._task_plan = None
+        self._current_subtask_index = 0
+        self._execution_hashes = []
+
+        category = self.router.classify_task(user_message)
+        self.context.add_observation(
+            f"Task classified as {category.value}",
+            trust=TrustLevel.SYSTEM_DERIVED,
+        )
 
         max_iterations = 50
 
@@ -225,6 +244,11 @@ class Orchestrator:
                     user_message, phase_history
                 )
 
+            elif current_phase == TaskPhase.SECURITY_CHECK:
+                current_phase = self._phase_security_check(
+                    user_message, phase_history
+                )
+
             elif current_phase == TaskPhase.DIAGNOSE:
                 current_phase = self._phase_diagnose(
                     user_message, phase_history, diagnoses
@@ -245,6 +269,7 @@ class Orchestrator:
                 )
                 if current_phase == TaskPhase.DIAGNOSE:
                     retry_count += 1
+                    self.budget.record_retry()
 
             elif current_phase == TaskPhase.REVIEW:
                 current_phase = self._phase_review(
@@ -267,6 +292,8 @@ class Orchestrator:
 
         self.budget.stop()
         final_response = self._get_final_response()
+
+        self._record_memory(user_message, diagnoses, fixes, current_phase)
 
         return _build_report_from_executions(
             task=user_message,
@@ -311,19 +338,20 @@ class Orchestrator:
         return result
 
     def _record_test_execution(self, result: dict) -> None:
+        inner = result.get("result") if isinstance(result.get("result"), dict) else None
         self._accumulated_executions.append(ToolExecution(
             step=len(self._accumulated_executions) + 1,
             tool_name="run_tests",
             arguments={"args": "-v"},
             success=result.get("success", False),
-            result=result.get("result"),
+            result=inner,
             error=result.get("error"),
         ))
         self.context.test_results = result
         if not result.get("success", False):
             stdout = ""
-            if isinstance(result.get("result"), dict):
-                stdout = result["result"].get("stdout", "")
+            if isinstance(inner, dict):
+                stdout = inner.get("stdout", "")
             elif result.get("error"):
                 stdout = result["error"]
             self.context.record_failure(stdout[:500])
@@ -353,13 +381,14 @@ class Orchestrator:
         response = self._run_agent_step(prompt)
 
         try:
-            import json as _json
-            data = _json.loads(response)
+            data = json.loads(response)
             is_valid, errors, plan = PlanValidator.validate_plan(data)
             if is_valid and plan is not None:
                 self.context.set_plan(plan.to_dict())
                 self._plan_validated = True
                 self._plan_rejected = False
+                self._task_plan = plan
+                self._current_subtask_index = 0
                 self.context.add_observation(
                     "Plan validated successfully",
                     trust=TrustLevel.SYSTEM_DERIVED,
@@ -373,7 +402,7 @@ class Orchestrator:
                 )
                 phase_history.append(TaskPhase.FAILED.value)
                 return TaskPhase.FAILED
-        except (_json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError):
             self._plan_validated = False
             self._plan_rejected = False
             self.context.add_observation(
@@ -438,7 +467,7 @@ class Orchestrator:
                 "Tests passed", trust=TrustLevel.TOOL_VERIFIED
             )
             return True, self._advance(
-                TaskPhase.TEST, TaskPhase.REVIEW, phase_history
+                TaskPhase.TEST, TaskPhase.SECURITY_CHECK, phase_history
             )
         else:
             self.context.add_observation(
@@ -447,6 +476,57 @@ class Orchestrator:
             return False, self._advance(
                 TaskPhase.TEST, TaskPhase.DIAGNOSE, phase_history
             )
+
+    def _phase_security_check(
+        self, task: str, phase_history: list[str]
+    ) -> TaskPhase:
+        self.context.transition_to("SECURITY_CHECK")
+        files_modified = []
+        for ex in self._accumulated_executions:
+            if ex.success and ex.tool_name in ("write_file", "edit_file"):
+                path = ex.arguments.get("path", "")
+                if path and path not in files_modified:
+                    files_modified.append(path)
+
+        findings: list[str] = []
+        for ex in self._accumulated_executions:
+            if ex.tool_name == "run_command" and ex.success:
+                cmd = ex.arguments.get("command", "")
+                cmd_lower = cmd.lower()
+                if any(sus in cmd_lower for sus in ["curl ", "wget ", "eval ", "exec(", "os.system", "subprocess"]):
+                    findings.append(f"Suspicious command executed: {cmd}")
+
+        for path in files_modified:
+            try:
+                with open(path) as f:
+                    content = f.read()
+                if "curl " in content or "wget " in content:
+                    findings.append(f"Network fetch found in {path}")
+                if "eval(" in content or "exec(" in content:
+                    findings.append(f"Dynamic code execution found in {path}")
+                if "password" in content.lower() or "secret" in content.lower():
+                    findings.append(f"Potential secret in {path}")
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        if findings:
+            self.context.add_observation(
+                f"Security check: {len(findings)} findings",
+                trust=TrustLevel.TOOL_VERIFIED,
+            )
+            self.context.add_observation(
+                "\n".join(findings),
+                trust=TrustLevel.TOOL_VERIFIED,
+            )
+        else:
+            self.context.add_observation(
+                "Security check passed",
+                trust=TrustLevel.TOOL_VERIFIED,
+            )
+
+        return self._advance(
+            TaskPhase.SECURITY_CHECK, TaskPhase.REVIEW, phase_history
+        )
 
     def _phase_diagnose(
         self,
@@ -476,7 +556,8 @@ class Orchestrator:
         prompt += (
             f"\n\nTests failed. Actual failure output:\n{test_failures[:3000]}\n\n"
             f"Automated classification: {diag.category.value}\n"
-            f"Hypothesis: {diag.hypothesis}\n\n"
+            f"Hypothesis: {diag.hypothesis}\n"
+            f"Suggested fix: {diag.suggested_fix}\n\n"
             f"Analyze the failure. Identify the root cause, failing tests, "
             f"and relevant files. Do not make changes yet."
         )
@@ -525,7 +606,7 @@ class Orchestrator:
         max_retries: int,
     ) -> TaskPhase:
         self.context.transition_to("RETEST")
-        if retry_count >= max_retries:
+        if retry_count >= max_retries - 1:
             phase_history.append(TaskPhase.FAILED.value)
             return TaskPhase.FAILED
 
@@ -576,6 +657,26 @@ class Orchestrator:
 
         self._last_review_result = review_result
 
+        from app.models.schemas import ReviewVerdict
+
+        if review_result.verdict == ReviewVerdict.NEEDS_MORE_EVIDENCE:
+            self.context.add_observation(
+                "Reviewer requested more evidence",
+                trust=TrustLevel.MODEL_INFERRED,
+            )
+            self._review_feedback = (
+                f"The reviewer needs more evidence.\n"
+                f"Summary: {review_result.summary}\n"
+            )
+            if review_result.findings:
+                for f in review_result.findings:
+                    self._review_feedback += f'  [{f["severity"]}] {f["description"]}\n'
+            else:
+                self._review_feedback += "  No specific findings.\n"
+            self.context.review_feedback = self._review_feedback
+            self._review_retry_count += 1
+            return self._advance(TaskPhase.REVIEW, TaskPhase.INSPECT, phase_history)
+
         if review_result.approved:
             self.context.add_observation(
                 "Review approved", trust=TrustLevel.TOOL_VERIFIED
@@ -598,11 +699,7 @@ class Orchestrator:
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
         self.context.transition_to("VALIDATE")
-        test_results = None
-        for ex in reversed(self._accumulated_executions):
-            if ex.tool_name == "run_tests" and isinstance(ex.result, dict):
-                test_results = ex.result
-                break
+        test_results = self.context.test_results
 
         files_modified = []
         for ex in self._accumulated_executions:
@@ -611,15 +708,39 @@ class Orchestrator:
                 if path and path not in files_modified:
                     files_modified.append(path)
 
+        expected_files: list[str] | None = None
+        if self._task_plan and self._task_plan.subtasks:
+            expected_files = []
+            for st in self._task_plan.subtasks:
+                for criterion in st.acceptance_criteria:
+                    if criterion.startswith("file:"):
+                        expected_files.append(criterion[5:])
+
+        execution_dicts = [
+            {"tool_name": ex.tool_name, "success": ex.success, "error": ex.error}
+            for ex in self._accumulated_executions
+            if ex.tool_name != "run_tests"
+        ]
+
         validation = self.validator.validate_all(
             test_results=test_results,
             files_modified=files_modified,
+            expected_files=expected_files,
+            executions=execution_dicts,
         )
 
         self.context.add_observation(
             f"Validation: {'passed' if validation.overall_passed else 'failed'}",
             trust=TrustLevel.SYSTEM_DERIVED,
         )
+
+        if not validation.overall_passed:
+            self.context.add_observation(
+                f"Validation failures: {'; '.join(r.details for r in validation.results if not r.passed)}",
+                trust=TrustLevel.SYSTEM_DERIVED,
+            )
+            phase_history.append(TaskPhase.FAILED.value)
+            return TaskPhase.FAILED
 
         return self._advance(TaskPhase.VALIDATE, TaskPhase.REPORT, phase_history)
 
@@ -695,6 +816,23 @@ class Orchestrator:
             test_results=test_results_str,
             context=review_context,
         )
+
+    def _record_memory(
+        self,
+        task: str,
+        diagnoses: list[str],
+        fixes: list[str],
+        final_phase: TaskPhase,
+    ) -> None:
+        if final_phase == TaskPhase.DONE:
+            for fix in fixes[-3:]:
+                self.memory.add_successful_fix(fix[:200])
+            self.memory.add_decision(f"Completed: {task[:100]}")
+        elif final_phase == TaskPhase.FAILED:
+            for diag in diagnoses[-3:]:
+                self.memory.add_failure(diag[:200])
+
+        self.memory.save()
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [tool.to_dict() for tool in self.core.tools.values()]

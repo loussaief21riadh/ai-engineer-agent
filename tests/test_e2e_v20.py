@@ -33,6 +33,15 @@ def _phase_responses(*contents):
     return [ChatResponse(content=c) for c in contents]
 
 
+def _review_response(approved=True, findings=None, summary="LGTM", verdict="APPROVE"):
+    return ChatResponse(content=json.dumps({
+        "approved": approved,
+        "verdict": verdict,
+        "findings": findings or [],
+        "summary": summary,
+    }))
+
+
 class TestEndToEndHappyPath:
     def test_full_cycle_with_context_continuity(self):
         mock_client = MagicMock()
@@ -43,7 +52,7 @@ class TestEndToEndHappyPath:
             "Added 'import os' to main.py",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "LGTM",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "LGTM",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -74,7 +83,7 @@ class TestEndToEndHappyPath:
         inspect_result = ChatResponse(content="Read app/main.py: line 42 has the bug")
         implement = ChatResponse(content="Fixed line 42")
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = [understand, plan, inspect, inspect_result, implement, reviewer]
 
@@ -98,7 +107,7 @@ class TestEndToEndFailureRecovery:
             "Applied None check fix.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "Fixed.",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "Fixed.",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -132,12 +141,12 @@ class TestEndToEndFailureRecovery:
             "Fixed based on review feedback.",
         )
         reviewer_first = ChatResponse(content=json.dumps({
-            "approved": False,
+            "approved": False, "verdict": "REJECT",
             "findings": [{"severity": "warning", "category": "quality", "description": "Missing docstring"}],
             "summary": "Needs docs.",
         }))
         reviewer_second = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK.",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK.",
         }))
         mock_client.chat.side_effect = responses + [reviewer_first, reviewer_second]
 
@@ -199,7 +208,7 @@ class TestEndToEndPlannerIntegration:
             "Implemented.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -271,7 +280,7 @@ class TestEndToEndPlannerIntegration:
             "Implemented.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -309,7 +318,7 @@ class TestEndToEndDiagnosticsIntegration:
             "Final fix.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -356,7 +365,7 @@ class TestEndToEndBudgetIntegration:
         mock_client = MagicMock()
         responses = _phase_responses("A", "B", "C", "D")
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -431,7 +440,7 @@ class TestEndToEndBudgetIntegration:
         mock_client = MagicMock()
         responses = _phase_responses("A", "B", "C", "D")
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -456,7 +465,7 @@ class TestEndToEndAntiFabrication:
         mock_client = MagicMock()
         responses = _phase_responses("I read everything.", "Plan.", "Inspected.", "Done.")
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -476,7 +485,7 @@ class TestEndToEndAntiFabrication:
             "Done.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -496,7 +505,7 @@ class TestEndToEndContextTrustLevels:
             "Done.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -515,7 +524,7 @@ class TestEndToEndContextTrustLevels:
             "Done.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -539,7 +548,7 @@ class TestReviewerContextIntegration:
             "Applied null check fix.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -572,7 +581,7 @@ class TestReviewerContextIntegration:
             "Fixed: added missing import.",
         )
         reviewer = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
@@ -602,7 +611,7 @@ class TestReviewerContextIntegration:
 
         mock_client = MagicMock()
         mock_client.chat.return_value = ChatResponse(content=json.dumps({
-            "approved": True, "findings": [], "summary": "OK",
+            "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
         reviewer = Reviewer(client=mock_client)
 
