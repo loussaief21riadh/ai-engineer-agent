@@ -49,6 +49,10 @@ class ModelRouter:
             return config.fallback
         return self.fallback_model or self.default_model
 
+    def get_model(self, category: TaskCategory) -> tuple[str, str]:
+        """Return (primary_model, fallback_model) for the given task category."""
+        return self.route(category), self.get_fallback(category)
+
     def classify_task(self, task_description: str) -> TaskCategory:
         lower = task_description.lower()
 

@@ -14,6 +14,7 @@ class TrustLevel(str, Enum):
     SYSTEM_DERIVED = "SYSTEM_DERIVED"
     MODEL_PROPOSED = "MODEL_PROPOSED"
     MODEL_INFERRED = "MODEL_INFERRED"
+    FILE_CONTENT = "FILE_CONTENT"
 
 
 class ContextEntry(BaseModel):
@@ -104,8 +105,12 @@ class ContextBuilder:
     MAX_FAILURES = 5
     MAX_DIAGNOSES = 5
 
-    def build_phase_prompt(self, ctx: TaskContext, phase: str, task: str) -> str:
+    def build_phase_prompt(self, ctx: TaskContext, phase: str, task: str, memory_context: str = "") -> str:
         parts: list[str] = []
+
+        if memory_context and memory_context != "No project memory available.":
+            parts.append(memory_context)
+            parts.append("")
 
         parts.append(f"Task: {task}")
         parts.append(f"Phase: {phase}")

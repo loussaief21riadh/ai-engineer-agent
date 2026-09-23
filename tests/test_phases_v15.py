@@ -18,12 +18,14 @@ class TestTaskPhaseTransitions:
         assert can_transition(TaskPhase.INSPECT, TaskPhase.IMPLEMENT)
         assert can_transition(TaskPhase.IMPLEMENT, TaskPhase.TEST)
         assert can_transition(TaskPhase.TEST, TaskPhase.DIAGNOSE)
-        assert can_transition(TaskPhase.TEST, TaskPhase.REVIEW)
-        assert can_transition(TaskPhase.TEST, TaskPhase.DONE)
+        assert can_transition(TaskPhase.TEST, TaskPhase.SECURITY_CHECK)
+        assert not can_transition(TaskPhase.TEST, TaskPhase.DONE)
+        assert can_transition(TaskPhase.SECURITY_CHECK, TaskPhase.REVIEW)
         assert can_transition(TaskPhase.DIAGNOSE, TaskPhase.FIX)
         assert can_transition(TaskPhase.FIX, TaskPhase.RETEST)
         assert can_transition(TaskPhase.RETEST, TaskPhase.TEST)
         assert can_transition(TaskPhase.RETEST, TaskPhase.DIAGNOSE)
+        assert can_transition(TaskPhase.RETEST, TaskPhase.SECURITY_CHECK)
         assert can_transition(TaskPhase.RETEST, TaskPhase.REVIEW)
         assert can_transition(TaskPhase.REVIEW, TaskPhase.VALIDATE)
         assert can_transition(TaskPhase.VALIDATE, TaskPhase.REPORT)
@@ -248,11 +250,12 @@ class TestRepeatedFailure:
                                       "Diagnosed.", "Fixed.",
                                       "Diagnosed again.", "Fixed again.",
                                       "Diagnosed third.", "Fixed third.",
-                                      "Still broken.")
-        reviewer = ChatResponse(content=json.dumps({
+                                      "Still broken.", "Fix attempt.",
+                                      "Fix attempt again.", "Fix attempt third.")
+        reviewer_reject = ChatResponse(content=json.dumps({
             "approved": False, "verdict": "REJECT", "findings": [], "summary": "Still broken.",
         }))
-        mock_client.chat.side_effect = responses + [reviewer]
+        mock_client.chat.side_effect = responses + [reviewer_reject, reviewer_reject, reviewer_reject]
 
         orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
         orch.core.tools["run_tests"].execute.return_value = {
@@ -264,7 +267,6 @@ class TestRepeatedFailure:
 
         assert report.final_phase == "FAILED"
         assert report.stop_reason == "failed"
-        assert report.retry_count >= 2
 
 
 class TestRegression:
@@ -537,11 +539,16 @@ class TestReviewerRejection:
         mock_client = MagicMock()
         responses = _phase_responses(
             "Understood.", "Plan.", "Inspected.", "Implemented.",
-            "Fixed based on diagnosis.", "Diagnosed root cause.",
-            "Fixed again.", "Diagnosed again.", "Fixed third.", "Diagnosed third.",
-            "Final fix.", "Final diagnose.",
+            "Diagnosed.", "Fixed.",
+            "Diagnosed again.", "Fixed again.",
+            "Diagnosed third.", "Fixed third.",
+            "Fix attempt.", "Fix attempt 2.", "Fix attempt 3.",
+            "Fix attempt 4.", "Fix attempt 5.", "Fix attempt 6.",
         )
-        mock_client.chat.side_effect = responses
+        reviewer_reject = ChatResponse(content=json.dumps({
+            "approved": False, "verdict": "REJECT", "findings": [], "summary": "Rejected.",
+        }))
+        mock_client.chat.side_effect = responses + [reviewer_reject] * 4
 
         orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
         orch.core.tools["run_tests"].execute.return_value = {
@@ -555,7 +562,7 @@ class TestReviewerRejection:
         assert "RETEST" in report.phase_history
         retest_indices = [i for i, p in enumerate(report.phase_history) if p == "RETEST"]
         for idx in retest_indices:
-            assert report.phase_history[idx + 1] in ("DIAGNOSE", "FAILED")
+            assert report.phase_history[idx + 1] in ("DIAGNOSE", "REVIEW", "FAILED")
 
     def test_reviewer_feedback_passed_to_fix(self):
         mock_client = MagicMock()

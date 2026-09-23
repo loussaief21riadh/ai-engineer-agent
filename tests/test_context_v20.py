@@ -17,7 +17,7 @@ class TestTrustLevels:
         assert "MODEL_INFERRED" in levels
 
     def test_trust_level_count(self):
-        assert len(TrustLevel) == 5
+        assert len(TrustLevel) == 6
 
 
 class TestContextEntry:

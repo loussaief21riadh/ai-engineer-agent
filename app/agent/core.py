@@ -153,7 +153,7 @@ IMPORTANT: Only call one tool at a time. After receiving the tool result, contin
 
         return tool_result
 
-    def run(self, user_message: str, max_steps: int = 0) -> str:
+    def run(self, user_message: str, max_steps: int = 0, model: str = "") -> str:
         effective_max = max_steps or MAX_AGENT_STEPS
         self.history = []
         self.executions = []
@@ -171,7 +171,7 @@ IMPORTANT: Only call one tool at a time. After receiving the tool result, contin
             steps += 1
 
             try:
-                chat_response = self._call_llm(messages)
+                chat_response = self._call_llm(messages, model=model)
             except OpenRouterError as exc:
                 return f"LLM error: {exc}"
 

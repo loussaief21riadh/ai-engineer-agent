@@ -316,11 +316,14 @@ class TestEndToEndDiagnosticsIntegration:
             "Fixed third.",
             "Diagnosed third.",
             "Final fix.",
+            "Review fix.",
+            "Review fix again.",
+            "Review fix third.",
         )
         reviewer = ChatResponse(content=json.dumps({
             "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
-        mock_client.chat.side_effect = responses + [reviewer]
+        mock_client.chat.side_effect = responses + [reviewer, reviewer, reviewer]
 
         orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
         orch.core.tools["run_tests"].execute.return_value = {
@@ -448,8 +451,7 @@ class TestEndToEndBudgetIntegration:
         orch.run_task("Simple task")
 
         total_chat_calls = mock_client.chat.call_count
-        agent_llm_calls = total_chat_calls - 1
-        assert orch.budget.llm_calls == agent_llm_calls
+        assert orch.budget.llm_calls == total_chat_calls
 
 
 class TestEndToEndRouterIntegration:

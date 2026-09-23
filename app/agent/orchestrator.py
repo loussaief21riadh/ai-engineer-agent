@@ -15,7 +15,7 @@ from app.agent.router import ModelRouter, TaskCategory
 from app.agent.validator import Validator
 from app.config import AGENT_MODE, MAX_RETRY_CYCLES, AgentMode
 from app.llm.openrouter import OpenRouterClient
-from app.models.schemas import TaskReport, ToolExecution
+from app.models.schemas import ExecutionEvidence, TaskReport, ToolExecution
 from app.tools.base import BaseTool
 from app.tools.edit import EditFileTool
 from app.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
@@ -121,7 +121,7 @@ class Orchestrator:
         self.memory = ProjectMemory.load()
 
         self.core = AgentCore(client=self.client, on_llm_call=self.budget.record_llm_call)
-        self.reviewer = Reviewer(client=self.client)
+        self.reviewer = Reviewer(client=self.client, on_llm_call=self.budget.record_llm_call)
         self._accumulated_executions: list[ToolExecution] = []
         self._last_review_result: Any = None
         self._review_retry_count: int = 0
@@ -131,6 +131,10 @@ class Orchestrator:
         self._task_plan: TaskPlan | None = None
         self._current_subtask_index: int = 0
         self._execution_hashes: list[str] = []
+        self._execution_evidence: list[ExecutionEvidence] = []
+        self._selected_model: str = ""
+        self._selected_fallback: str = ""
+        self._critical_security_findings: list[str] = []
 
         self._register_default_tools()
 
@@ -178,10 +182,13 @@ class Orchestrator:
         self._task_plan = None
         self._current_subtask_index = 0
         self._execution_hashes = []
+        self._execution_evidence = []
+        self._critical_security_findings = []
 
         category = self.router.classify_task(user_message)
+        self._selected_model, self._selected_fallback = self.router.get_model(category)
         self.context.add_observation(
-            f"Task classified as {category.value}",
+            f"Task classified as {category.value}, model: {self._selected_model}",
             trust=TrustLevel.SYSTEM_DERIVED,
         )
 
@@ -313,14 +320,16 @@ class Orchestrator:
             else "failed",
         )
 
-    def _run_agent_step(self, phase_prompt: str) -> str:
+    def _run_agent_step(self, phase_prompt: str, model: str = "") -> str:
         self.core.history.clear()
         self.core.executions.clear()
-        result = self.core.run(phase_prompt, max_steps=10)
+        result = self.core.run(phase_prompt, max_steps=10, model=model)
         self._accumulated_executions.extend(self.core.executions)
 
         for ex in self.core.executions:
             self.budget.record_tool_call()
+            evidence = ExecutionEvidence.from_tool_execution(ex)
+            self._execution_evidence.append(evidence)
             self.context.record_execution({
                 "tool_name": ex.tool_name,
                 "success": ex.success,
@@ -332,21 +341,23 @@ class Orchestrator:
                 self.context.record_inspected_file(path, content)
                 self.context.add_observation(
                     f"Read file {path}",
-                    trust=TrustLevel.TOOL_VERIFIED,
+                    trust=TrustLevel.FILE_CONTENT,
                 )
 
         return result
 
     def _record_test_execution(self, result: dict) -> None:
         inner = result.get("result") if isinstance(result.get("result"), dict) else None
-        self._accumulated_executions.append(ToolExecution(
+        test_ex = ToolExecution(
             step=len(self._accumulated_executions) + 1,
             tool_name="run_tests",
             arguments={"args": "-v"},
             success=result.get("success", False),
             result=inner,
             error=result.get("error"),
-        ))
+        )
+        self._accumulated_executions.append(test_ex)
+        self._execution_evidence.append(ExecutionEvidence.from_tool_execution(test_ex))
         self.context.test_results = result
         if not result.get("success", False):
             stdout = ""
@@ -356,15 +367,21 @@ class Orchestrator:
                 stdout = result["error"]
             self.context.record_failure(stdout[:500])
 
+    def _get_memory_context(self) -> str:
+        ctx_str = self.memory.to_context_string()
+        if ctx_str == "No project memory available.":
+            return ""
+        return ctx_str
+
     def _phase_understand(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
         self.context.transition_to("UNDERSTAND")
         prompt = self.context_builder.build_phase_prompt(
-            self.context, "UNDERSTAND", task
+            self.context, "UNDERSTAND", task, memory_context=self._get_memory_context()
         )
         prompt += "\n\nAnalyze the task. What is being asked? What files are likely involved? Do not make changes yet."
-        self._run_agent_step(prompt)
+        self._run_agent_step(prompt, model=self._selected_model)
         return self._advance(TaskPhase.UNDERSTAND, TaskPhase.PLAN, phase_history)
 
     def _phase_plan(
@@ -372,13 +389,13 @@ class Orchestrator:
     ) -> TaskPhase:
         self.context.transition_to("PLAN")
         prompt = self.context_builder.build_phase_prompt(
-            self.context, "PLAN", task
+            self.context, "PLAN", task, memory_context=self._get_memory_context()
         )
         prompt += (
             "\n\nCreate a step-by-step plan. List the files to inspect and changes to make. "
             "Do not implement yet."
         )
-        response = self._run_agent_step(prompt)
+        response = self._run_agent_step(prompt, model=self._selected_model)
 
         try:
             data = json.loads(response)
@@ -417,12 +434,12 @@ class Orchestrator:
     ) -> TaskPhase:
         self.context.transition_to("INSPECT")
         prompt = self.context_builder.build_phase_prompt(
-            self.context, "INSPECT", task
+            self.context, "INSPECT", task, memory_context=self._get_memory_context()
         )
         prompt += (
             "\n\nRead the relevant files. Understand the current code before making changes."
         )
-        self._run_agent_step(prompt)
+        self._run_agent_step(prompt, model=self._selected_model)
         return self._advance(TaskPhase.INSPECT, TaskPhase.IMPLEMENT, phase_history)
 
     def _phase_implement(
@@ -431,7 +448,7 @@ class Orchestrator:
         self.context.transition_to("IMPLEMENT")
         if self.mode == AgentMode.READ_ONLY:
             prompt = self.context_builder.build_phase_prompt(
-                self.context, "IMPLEMENT (READ-ONLY)", task
+                self.context, "IMPLEMENT (READ-ONLY)", task, memory_context=self._get_memory_context()
             )
             prompt += (
                 "\n\nYou are in read-only mode. You cannot write files. "
@@ -439,12 +456,12 @@ class Orchestrator:
             )
         else:
             prompt = self.context_builder.build_phase_prompt(
-                self.context, "IMPLEMENT", task
+                self.context, "IMPLEMENT", task, memory_context=self._get_memory_context()
             )
             prompt += (
                 "\n\nImplement the planned changes. Make minimal, targeted modifications."
             )
-        self._run_agent_step(prompt)
+        self._run_agent_step(prompt, model=self._selected_model)
         return self._advance(TaskPhase.IMPLEMENT, TaskPhase.TEST, phase_history)
 
     def _phase_test(
@@ -453,9 +470,12 @@ class Orchestrator:
         self.context.transition_to("TEST")
         test_tool = self.core.tools.get("run_tests")
         if test_tool is None:
-            return True, self._advance(
-                TaskPhase.TEST, TaskPhase.REVIEW, phase_history
+            self.context.add_observation(
+                "No test tool registered — cannot verify tests",
+                trust=TrustLevel.SYSTEM_DERIVED,
             )
+            phase_history.append(TaskPhase.FAILED.value)
+            return False, TaskPhase.FAILED
 
         result = test_tool.execute(args="-v")
         self.budget.record_tool_call()
@@ -489,40 +509,56 @@ class Orchestrator:
                     files_modified.append(path)
 
         findings: list[str] = []
+        critical_findings: list[str] = []
+        high_findings: list[str] = []
+
         for ex in self._accumulated_executions:
             if ex.tool_name == "run_command" and ex.success:
                 cmd = ex.arguments.get("command", "")
                 cmd_lower = cmd.lower()
                 if any(sus in cmd_lower for sus in ["curl ", "wget ", "eval ", "exec(", "os.system", "subprocess"]):
-                    findings.append(f"Suspicious command executed: {cmd}")
+                    high_findings.append(f"Suspicious command executed: {cmd}")
 
         for path in files_modified:
             try:
                 with open(path) as f:
                     content = f.read()
                 if "curl " in content or "wget " in content:
-                    findings.append(f"Network fetch found in {path}")
+                    critical_findings.append(f"Network fetch found in {path}")
                 if "eval(" in content or "exec(" in content:
-                    findings.append(f"Dynamic code execution found in {path}")
+                    critical_findings.append(f"Dynamic code execution found in {path}")
                 if "password" in content.lower() or "secret" in content.lower():
-                    findings.append(f"Potential secret in {path}")
+                    critical_findings.append(f"Potential secret in {path}")
             except (OSError, UnicodeDecodeError):
                 pass
 
-        if findings:
+        all_findings = critical_findings + high_findings + findings
+        self._critical_security_findings = critical_findings
+
+        if all_findings:
+            severity_label = f"CRITICAL={len(critical_findings)}, HIGH={len(high_findings)}"
             self.context.add_observation(
-                f"Security check: {len(findings)} findings",
+                f"Security check: {len(all_findings)} findings ({severity_label})",
                 trust=TrustLevel.TOOL_VERIFIED,
             )
-            self.context.add_observation(
-                "\n".join(findings),
-                trust=TrustLevel.TOOL_VERIFIED,
-            )
+            for f in all_findings:
+                self.context.add_observation(
+                    f"  - {f}",
+                    trust=TrustLevel.TOOL_VERIFIED,
+                )
         else:
             self.context.add_observation(
                 "Security check passed",
                 trust=TrustLevel.TOOL_VERIFIED,
             )
+
+        if critical_findings:
+            self.context.add_observation(
+                f"BLOCKED: {len(critical_findings)} CRITICAL security findings detected",
+                trust=TrustLevel.SYSTEM_DERIVED,
+            )
+            phase_history.append(TaskPhase.FAILED.value)
+            return TaskPhase.FAILED
 
         return self._advance(
             TaskPhase.SECURITY_CHECK, TaskPhase.REVIEW, phase_history
@@ -551,7 +587,7 @@ class Orchestrator:
         )
 
         prompt = self.context_builder.build_phase_prompt(
-            self.context, "DIAGNOSE", task
+            self.context, "DIAGNOSE", task, memory_context=self._get_memory_context()
         )
         prompt += (
             f"\n\nTests failed. Actual failure output:\n{test_failures[:3000]}\n\n"
@@ -561,7 +597,7 @@ class Orchestrator:
             f"Analyze the failure. Identify the root cause, failing tests, "
             f"and relevant files. Do not make changes yet."
         )
-        response = self._run_agent_step(prompt)
+        response = self._run_agent_step(prompt, model=self._selected_model)
         diagnoses.append(response[:500])
         self.context.record_diagnosis(response[:500])
         return self._advance(TaskPhase.DIAGNOSE, TaskPhase.FIX, phase_history)
@@ -576,7 +612,7 @@ class Orchestrator:
         if self._review_feedback:
             self.context.review_feedback = self._review_feedback
             prompt = self.context_builder.build_phase_prompt(
-                self.context, "FIX (reviewer rejection)", task
+                self.context, "FIX (reviewer rejection)", task, memory_context=self._get_memory_context()
             )
             prompt += (
                 "\n\nThe reviewer rejected the implementation with the feedback above. "
@@ -585,13 +621,13 @@ class Orchestrator:
             )
         else:
             prompt = self.context_builder.build_phase_prompt(
-                self.context, "FIX", task
+                self.context, "FIX", task, memory_context=self._get_memory_context()
             )
             prompt += (
                 "\n\nApply the minimal fix based on your diagnosis. "
                 "Do not refactor unrelated code."
             )
-        response = self._run_agent_step(prompt)
+        response = self._run_agent_step(prompt, model=self._selected_model)
         fixes.append(response[:500])
         self.context.record_fix(response[:500])
         self._review_feedback = ""
@@ -607,8 +643,9 @@ class Orchestrator:
     ) -> TaskPhase:
         self.context.transition_to("RETEST")
         if retry_count >= max_retries - 1:
-            phase_history.append(TaskPhase.FAILED.value)
-            return TaskPhase.FAILED
+            return self._advance(
+                TaskPhase.RETEST, TaskPhase.REVIEW, phase_history
+            )
 
         test_tool = self.core.tools.get("run_tests")
         if test_tool is None:
@@ -626,7 +663,7 @@ class Orchestrator:
                 "Retest passed", trust=TrustLevel.TOOL_VERIFIED
             )
             return self._advance(
-                TaskPhase.RETEST, TaskPhase.REVIEW, phase_history
+                TaskPhase.RETEST, TaskPhase.SECURITY_CHECK, phase_history
             )
         else:
             self.context.add_observation(
@@ -815,6 +852,7 @@ class Orchestrator:
             diff=diff_text,
             test_results=test_results_str,
             context=review_context,
+            model=self._selected_model,
         )
 
     def _record_memory(

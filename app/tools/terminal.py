@@ -30,22 +30,145 @@ ALLOWED_COMMANDS: dict[str, list[str]] = {
 }
 
 BLOCKED_GIT_SUBCOMMANDS: set[str] = {
+    "add",
     "push",
     "commit",
     "reset",
     "checkout",
-    "branch",
     "merge",
     "rebase",
-    "stash",
     "cherry-pick",
     "revert",
-    "tag",
     "config",
     "clean",
     "restore",
     "switch",
+    "clone",
+    "init",
+    "pull",
+    "fetch",
+    "rm",
+    "mv",
 }
+
+GIT_WRITE_SUBCOMMANDS: set[str] = {
+    "push",
+    "commit",
+    "reset",
+    "checkout",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "config",
+    "clean",
+    "restore",
+    "switch",
+    "clone",
+    "init",
+    "pull",
+    "fetch",
+    "rm",
+    "mv",
+    "add",
+}
+
+GIT_CONDITIONAL_SUBCOMMANDS: dict[str, set[str]] = {
+    "branch": {"feature", "new", "main", "master", "dev", "develop"},
+    "stash": {"push", "save", "pop", "apply", "drop", "clear", "branch", "create"},
+    "tag": {"-d", "-f", "-a", "-s", "-u", "--delete", "--force"},
+}
+
+
+def _is_write_git_subcommand(subcmd: str, args: list[str]) -> bool:
+    """Check if a git subcommand is a write/destructive operation."""
+    if subcmd in GIT_WRITE_SUBCOMMANDS:
+        return True
+
+    if subcmd in BLOCKED_GIT_SUBCOMMANDS:
+        return True
+
+    if subcmd == "branch":
+        write_flags = {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy"}
+        for arg in args:
+            if arg in write_flags:
+                return True
+        if args:
+            first = args[0]
+            if not first.startswith("-"):
+                return True
+        return False
+
+    if subcmd == "stash":
+        write_stash = {"push", "save", "pop", "apply", "drop", "clear", "branch", "create"}
+        if not args:
+            return True
+        if args[0] in write_stash:
+            return True
+        return False
+
+    if subcmd == "tag":
+        if not args:
+            return False
+        if args[0] in ("-l", "--list", "-n", "--contains", "--sort", "--format"):
+            return False
+        return True
+
+    return False
+
+GIT_GLOBAL_OPTIONS: set[str] = {
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--exec-path",
+}
+
+
+def _extract_git_subcommand(parts: list[str]) -> str | None:
+    """Extract the actual git subcommand, skipping global options."""
+    if len(parts) < 2:
+        return None
+    i = 1
+    while i < len(parts):
+        part = parts[i]
+        if part in GIT_GLOBAL_OPTIONS:
+            i += 2
+            continue
+        if part.startswith("-C") and len(part) > 2:
+            i += 1
+            continue
+        if part.startswith("--git-dir=") or part.startswith("--work-tree=") or part.startswith("--exec-path="):
+            i += 1
+            continue
+        return part
+    return None
+
+
+def _get_git_args(parts: list[str]) -> list[str]:
+    """Extract the arguments after the git subcommand, skipping global options."""
+    if len(parts) < 2:
+        return []
+    i = 1
+    subcmd_found = False
+    args: list[str] = []
+    while i < len(parts):
+        part = parts[i]
+        if not subcmd_found:
+            if part in GIT_GLOBAL_OPTIONS:
+                i += 2
+                continue
+            if part.startswith("-C") and len(part) > 2:
+                i += 1
+                continue
+            if part.startswith("--git-dir=") or part.startswith("--work-tree=") or part.startswith("--exec-path="):
+                i += 1
+                continue
+            subcmd_found = True
+            i += 1
+            continue
+        args.append(part)
+        i += 1
+    return args
 
 
 def _validate_command(command: str) -> tuple[bool, str, list[str]]:
@@ -69,9 +192,12 @@ def _validate_command(command: str) -> tuple[bool, str, list[str]]:
         allowed = sorted(ALLOWED_COMMANDS.keys())
         return False, f"Unknown executable: '{executable}'. Allowed: {', '.join(allowed)}", []
 
-    if executable == "git" and len(parts) >= 2:
-        subcmd = parts[1]
-        if subcmd in BLOCKED_GIT_SUBCOMMANDS:
+    if executable == "git":
+        subcmd = _extract_git_subcommand(parts)
+        if subcmd is None:
+            return False, "git command with no subcommand", []
+        git_args = _get_git_args(parts)
+        if _is_write_git_subcommand(subcmd, git_args):
             return False, f"Blocked git subcommand: '{subcmd}'", []
 
     if executable == "python" or executable == "python3":
