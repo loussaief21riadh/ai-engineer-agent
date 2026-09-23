@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from enum import Enum
 from typing import Any
 
@@ -49,6 +50,10 @@ class Validator:
         executions: list[dict[str, Any]] | None = None,
     ) -> ValidationReport:
         report = ValidationReport()
+
+        if files_modified:
+            syntax_result = self.validate_syntax(files_modified)
+            report.add(syntax_result)
 
         if test_results is not None:
             report.add(self.validate_test_exit_code(test_results))
@@ -127,6 +132,30 @@ class Validator:
 
         return ValidationResult(
             check=ValidationCheck.TESTS,
+            passed=passed,
+            details=details,
+            evidence=evidence,
+        )
+
+    def validate_syntax(self, files_modified: list[str]) -> ValidationResult:
+        syntax_errors: list[str] = []
+        py_files = [f for f in files_modified if f.endswith(".py")]
+        for filepath in py_files:
+            try:
+                with open(filepath) as f:
+                    source = f.read()
+                ast.parse(source, filename=filepath)
+            except SyntaxError as e:
+                syntax_errors.append(f"{filepath}:{e.lineno}: {e.msg}")
+            except (OSError, UnicodeDecodeError):
+                pass
+
+        passed = len(syntax_errors) == 0
+        details = f"Checked {len(py_files)} Python files"
+        evidence = "\n".join(syntax_errors) if syntax_errors else "All files have valid syntax"
+
+        return ValidationResult(
+            check=ValidationCheck.SYNTAX,
             passed=passed,
             details=details,
             evidence=evidence,

@@ -18,10 +18,16 @@ class ChatResponse:
         content: str,
         tool_calls: list[dict[str, Any]] | None = None,
         raw: dict[str, Any] | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
     ) -> None:
         self.content = content
         self.tool_calls = tool_calls or []
         self.raw = raw or {}
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
 
     @property
     def has_tool_calls(self) -> bool:
@@ -108,4 +114,7 @@ class OpenRouterClient:
             content=content,
             tool_calls=native_tool_calls,
             raw=data,
+            prompt_tokens=data.get("usage", {}).get("prompt_tokens", 0),
+            completion_tokens=data.get("usage", {}).get("completion_tokens", 0),
+            total_tokens=data.get("usage", {}).get("total_tokens", 0),
         )

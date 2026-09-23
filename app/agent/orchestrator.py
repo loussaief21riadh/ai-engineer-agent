@@ -5,8 +5,10 @@ from typing import Any
 
 from app.agent.context import ContextBuilder, TaskContext, TrustLevel
 from app.agent.core import AgentCore
+from app.agent.checkpoint import Checkpoint, CheckpointStore
 from app.agent.diagnostics import FailureAnalyzer
 from app.agent.memory import ProjectMemory
+from app.agent.observer import ObserverEngine
 from app.agent.phases import TaskPhase, can_transition
 from app.agent.planner import PlanValidator, SubtaskStatus, TaskPlan
 from app.agent.quota import BudgetTracker
@@ -22,6 +24,7 @@ from app.tools.filesystem import ListFilesTool, ReadFileTool, WriteFileTool
 from app.tools.terminal import RunCommandTool
 from app.tools.testing import RunTestsTool
 from app.tools.git import GitDiffTool, GitStatusTool
+from app.tools.ast_security import ASTSecurityAnalyzer
 
 
 def _build_report_from_executions(
@@ -39,6 +42,9 @@ def _build_report_from_executions(
     fixes: list[str] | None = None,
     stop_reason: str = "completed",
     validation_report: Any = None,
+    trace_events: list[Any] | None = None,
+    total_tokens: Any = None,
+    cost_estimate: float | None = None,
 ) -> TaskReport:
     files_inspected: list[str] = []
     files_modified: list[str] = []
@@ -100,6 +106,9 @@ def _build_report_from_executions(
         diagnoses=diagnoses or [],
         fixes=fixes or [],
         stop_reason=stop_reason,
+        trace_events=trace_events or [],
+        total_tokens=total_tokens,
+        cost_estimate=cost_estimate,
     )
 
 
@@ -120,8 +129,14 @@ class Orchestrator:
         self.router = ModelRouter()
         self.memory = ProjectMemory.load()
 
-        self.core = AgentCore(client=self.client, on_llm_call=self.budget.record_llm_call)
+        self.core = AgentCore(
+            client=self.client,
+            on_llm_call=self.budget.record_llm_call,
+            on_llm_response=self._on_llm_response,
+        )
         self.reviewer = Reviewer(client=self.client, on_llm_call=self.budget.record_llm_call)
+        self.observer = ObserverEngine()
+        self.checkpoint_store = CheckpointStore()
         self._accumulated_executions: list[ToolExecution] = []
         self._last_review_result: Any = None
         self._review_retry_count: int = 0
@@ -150,12 +165,99 @@ class Orchestrator:
             self.core.register_tool(WriteFileTool())
             self.core.register_tool(EditFileTool())
 
+    def _on_llm_response(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        from app.models.schemas import TokenUsage
+        tokens = TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+        self.observer.llm_call(
+            model=model,
+            phase=self.context.current_phase if isinstance(self.context.current_phase, str) else "",
+            tokens=tokens,
+        )
+
+    def _save_checkpoint(
+        self,
+        task_id: str,
+        task: str,
+        phase: str,
+        phase_history: list[str],
+        diagnoses: list[str],
+        fixes: list[str],
+        iteration_count: int,
+        retry_count: int,
+    ) -> None:
+        cp = Checkpoint(
+            task_id=task_id,
+            task=task,
+            phase=phase,
+            context_snapshot=self.context.model_dump(),
+            plan_snapshot=self._task_plan.to_dict() if self._task_plan else None,
+            executions=[ex.model_dump() for ex in self._accumulated_executions],
+            trace_events=[ev.model_dump() for ev in self.observer.events],
+            phase_history=phase_history,
+            diagnoses=diagnoses,
+            fixes=fixes,
+            iteration_count=iteration_count,
+            retry_count=retry_count,
+        )
+        self.checkpoint_store.save(cp)
+
+    def _advance_subtask_toInProgress(self) -> None:
+        if self._task_plan and self._task_plan.subtasks:
+            next_st = self._task_plan.get_next_subtask()
+            if next_st:
+                next_st.status = SubtaskStatus.IN_PROGRESS
+                self._current_subtask_index = self._task_plan.subtasks.index(next_st)
+                self.observer.emit(
+                    "subtask_started",
+                    subtask_id=next_st.id,
+                    details={"description": next_st.description},
+                )
+
+    def _complete_current_subtask(self, result: str = "") -> None:
+        if self._task_plan and self._task_plan.subtasks:
+            idx = self._current_subtask_index
+            if 0 <= idx < len(self._task_plan.subtasks):
+                st = self._task_plan.subtasks[idx]
+                st.status = SubtaskStatus.COMPLETED
+                st.result = result
+                self.observer.emit(
+                    "subtask_completed",
+                    subtask_id=st.id,
+                    details={"progress": self._task_plan.progress_summary()},
+                )
+
+    def _fail_current_subtask(self, result: str = "") -> None:
+        if self._task_plan and self._task_plan.subtasks:
+            idx = self._current_subtask_index
+            if 0 <= idx < len(self._task_plan.subtasks):
+                st = self._task_plan.subtasks[idx]
+                st.status = SubtaskStatus.FAILED
+                st.result = result
+                self.observer.emit(
+                    "subtask_failed",
+                    subtask_id=st.id,
+                    details={"progress": self._task_plan.progress_summary()},
+                )
+
     def set_mode(self, mode: AgentMode) -> None:
         self.mode = mode
         self.core.tools.clear()
         self._register_default_tools()
 
     def run_task(self, user_message: str) -> TaskReport:
+        self.observer = ObserverEngine()
+        self.observer.emit("task_received", details={"task": user_message[:200]})
+
         phase_history: list[str] = []
         diagnoses: list[str] = []
         fixes: list[str] = []
@@ -187,9 +289,14 @@ class Orchestrator:
 
         category = self.router.classify_task(user_message)
         self._selected_model, self._selected_fallback = self.router.get_model(category)
+        self.core._fallback_model = self._selected_fallback
         self.context.add_observation(
             f"Task classified as {category.value}, model: {self._selected_model}",
             trust=TrustLevel.SYSTEM_DERIVED,
+        )
+        self.observer.emit(
+            "task_classified",
+            details={"category": category.value, "model": self._selected_model},
         )
 
         max_iterations = 50
@@ -197,6 +304,7 @@ class Orchestrator:
         while current_phase not in (TaskPhase.DONE, TaskPhase.FAILED):
             if not self.budget.is_within_budget():
                 violation = self.budget.budget_violation() or "Budget exceeded"
+                self.observer.emit("budget_exceeded", details={"violation": violation})
                 return _build_report_from_executions(
                     task=user_message,
                     mode=self.mode.value,
@@ -217,6 +325,7 @@ class Orchestrator:
             self.context.retry_count = retry_count
 
             if iteration_count > max_iterations:
+                self.observer.emit("iteration_limit", details={"max": max_iterations})
                 return _build_report_from_executions(
                     task=user_message,
                     mode=self.mode.value,
@@ -231,6 +340,8 @@ class Orchestrator:
                     fixes=fixes,
                     stop_reason="iteration_limit_reached",
                 )
+
+            self.observer.phase_start(current_phase.value)
 
             if current_phase == TaskPhase.UNDERSTAND:
                 current_phase = self._phase_understand(user_message, phase_history)
@@ -297,7 +408,23 @@ class Orchestrator:
                 current_phase = TaskPhase.FAILED
                 phase_history.append(current_phase.value)
 
+            self.observer.phase_end(current_phase.value, success=(current_phase != TaskPhase.FAILED))
+            self._save_checkpoint(
+                task_id=self.observer.task_id,
+                task=user_message,
+                phase=current_phase.value,
+                phase_history=phase_history,
+                diagnoses=diagnoses,
+                fixes=fixes,
+                iteration_count=iteration_count,
+                retry_count=retry_count,
+            )
+
         self.budget.stop()
+        self.observer.emit(
+            "task_completed",
+            details={"final_phase": current_phase.value},
+        )
         final_response = self._get_final_response()
 
         self._record_memory(user_message, diagnoses, fixes, current_phase)
@@ -318,6 +445,9 @@ class Orchestrator:
             stop_reason="completed"
             if current_phase == TaskPhase.DONE
             else "failed",
+            trace_events=self.observer.events,
+            total_tokens=self.observer.total_tokens,
+            cost_estimate=self.observer.total_tokens.estimate_cost() if self.observer.total_tokens.total_tokens > 0 else None,
         )
 
     def _run_agent_step(self, phase_prompt: str, model: str = "") -> str:
@@ -335,6 +465,14 @@ class Orchestrator:
                 "success": ex.success,
                 "arguments": ex.arguments,
             })
+            phase_val = self.context.current_phase if isinstance(self.context.current_phase, str) else self.context.current_phase.value
+            self.observer.tool_call(
+                tool=ex.tool_name,
+                phase=phase_val,
+                duration_ms=ex.duration_ms,
+                success=ex.success,
+                details={"arguments": {k: str(v)[:100] for k, v in ex.arguments.items()}},
+            )
             if ex.tool_name == "read_file" and ex.success:
                 path = ex.arguments.get("path", "")
                 content = str(ex.result)[:500] if ex.result else ""
@@ -406,6 +544,7 @@ class Orchestrator:
                 self._plan_rejected = False
                 self._task_plan = plan
                 self._current_subtask_index = 0
+                self._advance_subtask_toInProgress()
                 self.context.add_observation(
                     "Plan validated successfully",
                     trust=TrustLevel.SYSTEM_DERIVED,
@@ -486,6 +625,7 @@ class Orchestrator:
             self.context.add_observation(
                 "Tests passed", trust=TrustLevel.TOOL_VERIFIED
             )
+            self._complete_current_subtask(result="Tests passed")
             return True, self._advance(
                 TaskPhase.TEST, TaskPhase.SECURITY_CHECK, phase_history
             )
@@ -523,14 +663,25 @@ class Orchestrator:
             try:
                 with open(path) as f:
                     content = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            if "password" in content.lower() or "secret" in content.lower():
+                critical_findings.append(f"Potential secret in {path}")
+
+            if path.endswith(".py"):
+                ast_analyzer = ASTSecurityAnalyzer()
+                ast_findings = ast_analyzer.analyze(content, filename=path)
+                for af in ast_findings:
+                    if af.severity == "CRITICAL":
+                        critical_findings.append(f"[AST] {af.description} in {path}:{af.line}")
+                    elif af.severity == "HIGH":
+                        high_findings.append(f"[AST] {af.description} in {path}:{af.line}")
+            else:
                 if "curl " in content or "wget " in content:
                     critical_findings.append(f"Network fetch found in {path}")
                 if "eval(" in content or "exec(" in content:
                     critical_findings.append(f"Dynamic code execution found in {path}")
-                if "password" in content.lower() or "secret" in content.lower():
-                    critical_findings.append(f"Potential secret in {path}")
-            except (OSError, UnicodeDecodeError):
-                pass
 
         all_findings = critical_findings + high_findings + findings
         self._critical_security_findings = critical_findings
@@ -557,9 +708,19 @@ class Orchestrator:
                 f"BLOCKED: {len(critical_findings)} CRITICAL security findings detected",
                 trust=TrustLevel.SYSTEM_DERIVED,
             )
+            self.observer.security_check(
+                findings_count=len(all_findings),
+                critical_count=len(critical_findings),
+                success=False,
+            )
             phase_history.append(TaskPhase.FAILED.value)
             return TaskPhase.FAILED
 
+        self.observer.security_check(
+            findings_count=len(all_findings),
+            critical_count=0,
+            success=True,
+        )
         return self._advance(
             TaskPhase.SECURITY_CHECK, TaskPhase.REVIEW, phase_history
         )
@@ -643,6 +804,32 @@ class Orchestrator:
     ) -> TaskPhase:
         self.context.transition_to("RETEST")
         if retry_count >= max_retries - 1:
+            if self._task_plan and self._task_plan.subtasks:
+                idx = self._current_subtask_index
+                if 0 <= idx < len(self._task_plan.subtasks):
+                    failed_st = self._task_plan.subtasks[idx]
+                    new_plan = self._task_plan.create_replan(
+                        failed_st.id,
+                        f"Failed after {max_retries} retries",
+                    )
+                    self._task_plan = new_plan
+                    self._current_subtask_index = 0
+                    self.context.set_plan(new_plan.to_dict())
+                    self.observer.emit(
+                        "plan_replanned",
+                        details={
+                            "version": new_plan.version,
+                            "reason": f"Replan after {failed_st.id} failure",
+                            "history_length": len(new_plan.history),
+                        },
+                    )
+                    self.context.add_observation(
+                        f"Plan replanned to version {new_plan.version} after persistent failure",
+                        trust=TrustLevel.SYSTEM_DERIVED,
+                    )
+                    return self._advance(
+                        TaskPhase.RETEST, TaskPhase.IMPLEMENT, phase_history
+                    )
             return self._advance(
                 TaskPhase.RETEST, TaskPhase.REVIEW, phase_history
             )
@@ -662,6 +849,7 @@ class Orchestrator:
             self.context.add_observation(
                 "Retest passed", trust=TrustLevel.TOOL_VERIFIED
             )
+            self._complete_current_subtask(result="Retest passed")
             return self._advance(
                 TaskPhase.RETEST, TaskPhase.SECURITY_CHECK, phase_history
             )
@@ -712,12 +900,14 @@ class Orchestrator:
                 self._review_feedback += "  No specific findings.\n"
             self.context.review_feedback = self._review_feedback
             self._review_retry_count += 1
+            self.observer.review(verdict="NEEDS_MORE_EVIDENCE")
             return self._advance(TaskPhase.REVIEW, TaskPhase.INSPECT, phase_history)
 
         if review_result.approved:
             self.context.add_observation(
                 "Review approved", trust=TrustLevel.TOOL_VERIFIED
             )
+            self.observer.review(verdict="APPROVE")
             return self._advance(TaskPhase.REVIEW, TaskPhase.VALIDATE, phase_history)
         else:
             findings_text = "; ".join(
@@ -730,6 +920,7 @@ class Orchestrator:
             )
             self.context.review_feedback = self._review_feedback
             self._review_retry_count += 1
+            self.observer.review(verdict="REJECT")
             return self._advance(TaskPhase.REVIEW, TaskPhase.FIX, phase_history)
 
     def _phase_validate(
@@ -776,9 +967,11 @@ class Orchestrator:
                 f"Validation failures: {'; '.join(r.details for r in validation.results if not r.passed)}",
                 trust=TrustLevel.SYSTEM_DERIVED,
             )
+            self.observer.validation(passed=False)
             phase_history.append(TaskPhase.FAILED.value)
             return TaskPhase.FAILED
 
+        self.observer.validation(passed=True)
         return self._advance(TaskPhase.VALIDATE, TaskPhase.REPORT, phase_history)
 
     def _phase_report(

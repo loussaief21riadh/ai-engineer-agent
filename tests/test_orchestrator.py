@@ -156,7 +156,7 @@ class TestAgentCoreRun:
         mock_client.chat.side_effect = OpenRouterError("API down")
         core = AgentCore(client=mock_client)
         result = core.run("Fail", max_steps=1)
-        assert "LLM error: API down" in result
+        assert "LLM error" in result and "API down" in result
 
     def test_tool_execution_exception_handled(self, mock_client, failing_tool):
         tool_call_response = ChatResponse(

@@ -11,6 +11,10 @@ from app.llm.openrouter import ChatResponse, OpenRouterClient, OpenRouterError
 from app.models.schemas import AgentMessage, ToolCall, ToolExecution, ToolResult
 from app.tools.base import BaseTool, ToolValidationError, validate_tool_arguments
 
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BASE_DELAY = 1.0
+LLM_RETRY_MAX_DELAY = 30.0
+
 
 def _parse_tool_call_from_text(text: str) -> ToolCall | None:
     pattern = r"```tool\s*\n(.*?)\n\s*```"
@@ -54,6 +58,7 @@ class AgentCore:
         client: OpenRouterClient | None = None,
         tools: dict[str, BaseTool] | None = None,
         on_llm_call: Any = None,
+        on_llm_response: Any = None,
     ) -> None:
         self.client = client or OpenRouterClient()
         self.tools = tools or {}
@@ -61,6 +66,8 @@ class AgentCore:
         self.executions: list[ToolExecution] = []
         self._use_native_tools = True
         self._on_llm_call = on_llm_call
+        self._on_llm_response = on_llm_response
+        self._fallback_model: str = ""
 
     def register_tool(self, tool: BaseTool) -> None:
         self.tools[tool.schema.name] = tool
@@ -170,10 +177,41 @@ IMPORTANT: Only call one tool at a time. After receiving the tool result, contin
         while steps < effective_max:
             steps += 1
 
-            try:
-                chat_response = self._call_llm(messages, model=model)
-            except OpenRouterError as exc:
-                return f"LLM error: {exc}"
+            chat_response = None
+            last_error = None
+            for attempt in range(LLM_MAX_RETRIES):
+                try:
+                    chat_response = self._call_llm(messages, model=model)
+                    break
+                except OpenRouterError as exc:
+                    last_error = exc
+                    if attempt < LLM_MAX_RETRIES - 1:
+                        delay = min(LLM_RETRY_BASE_DELAY * (2 ** attempt), LLM_RETRY_MAX_DELAY)
+                        time.sleep(delay)
+                    continue
+
+            if chat_response is None and self._fallback_model and self._fallback_model != model:
+                for attempt in range(LLM_MAX_RETRIES):
+                    try:
+                        chat_response = self._call_llm(messages, model=self._fallback_model)
+                        break
+                    except OpenRouterError as exc:
+                        last_error = exc
+                        if attempt < LLM_MAX_RETRIES - 1:
+                            delay = min(LLM_RETRY_BASE_DELAY * (2 ** attempt), LLM_RETRY_MAX_DELAY)
+                            time.sleep(delay)
+                        continue
+
+            if chat_response is None:
+                return f"LLM error after {LLM_MAX_RETRIES} retries: {last_error}"
+
+            if self._on_llm_response is not None:
+                self._on_llm_response(
+                    model=model or PRIMARY_MODEL,
+                    prompt_tokens=chat_response.prompt_tokens,
+                    completion_tokens=chat_response.completion_tokens,
+                    total_tokens=chat_response.total_tokens,
+                )
 
             tool_calls = self._extract_tool_calls(chat_response)
 

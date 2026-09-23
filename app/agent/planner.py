@@ -30,6 +30,8 @@ class TaskPlan(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     subtasks: list[Subtask] = Field(default_factory=list)
+    version: int = 1
+    history: list[dict[str, Any]] = Field(default_factory=list)
 
     def add_subtask(self, subtask: Subtask) -> None:
         self.subtasks.append(subtask)
@@ -93,7 +95,52 @@ class TaskPlan(BaseModel):
             "requirements": self.requirements,
             "constraints": self.constraints,
             "subtasks": [st.model_dump() for st in self.subtasks],
+            "version": self.version,
         }
+
+    def record_version(self, reason: str) -> None:
+        self.history.append({
+            "version": self.version,
+            "subtasks": [st.model_dump() for st in self.subtasks],
+            "reason": reason,
+        })
+
+    def create_replan(self, failed_subtask_id: str, failure_reason: str) -> TaskPlan:
+        self.record_version(f"Replan after failure of {failed_subtask_id}: {failure_reason}")
+        new_plan = TaskPlan(
+            objective=self.objective,
+            requirements=self.requirements,
+            constraints=self.constraints,
+            version=self.version + 1,
+            history=list(self.history),
+        )
+        for st in self.subtasks:
+            if st.id == failed_subtask_id:
+                new_subtask = Subtask(
+                    id=f"{st.id}_revised",
+                    description=f"[REPLANNED] {st.description}",
+                    dependencies=st.dependencies,
+                    acceptance_criteria=st.acceptance_criteria,
+                )
+                new_plan.add_subtask(new_subtask)
+            elif st.status == SubtaskStatus.COMPLETED:
+                completed_copy = Subtask(
+                    id=st.id,
+                    description=st.description,
+                    dependencies=st.dependencies,
+                    status=SubtaskStatus.COMPLETED,
+                    acceptance_criteria=st.acceptance_criteria,
+                    result=st.result,
+                )
+                new_plan.add_subtask(completed_copy)
+            else:
+                new_plan.add_subtask(Subtask(
+                    id=st.id,
+                    description=st.description,
+                    dependencies=st.dependencies,
+                    acceptance_criteria=st.acceptance_criteria,
+                ))
+        return new_plan
 
 
 class PlanValidator:

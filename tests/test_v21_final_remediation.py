@@ -661,7 +661,7 @@ class TestFIX8SecurityCheckCriticalBlocking:
 
         assert result == TaskPhase.FAILED
         assert len(orch._critical_security_findings) > 0
-        assert any("secret" in f.lower() for f in orch._critical_security_findings)
+        assert any("secret" in f.lower() or "sensitive" in f.lower() for f in orch._critical_security_findings)
 
     def test_high_finding_allows_review_direct(self):
         mock_client = MagicMock()
@@ -715,7 +715,7 @@ class TestFIX8SecurityCheckCriticalBlocking:
             orch._phase_security_check("critical task", phase_history)
 
         assert len(orch._critical_security_findings) > 0
-        assert any("Dynamic code execution" in f for f in orch._critical_security_findings)
+        assert any("Dynamic code execution" in f or "Dangerous function" in f or "eval()" in f for f in orch._critical_security_findings)
 
 
 # ============================================================

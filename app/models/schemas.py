@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from enum import Enum
 from typing import Any
 
@@ -100,6 +101,40 @@ class ReviewResult(BaseModel):
     summary: str = ""
 
 
+class TokenUsage(BaseModel):
+    """Token counts from a single LLM call."""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+    def estimate_cost(self, prompt_price: float = 0.000003, completion_price: float = 0.000015) -> float:
+        return self.prompt_tokens * prompt_price + self.completion_tokens * completion_price
+
+
+class TraceEvent(BaseModel):
+    """Structured trace event emitted by the observer."""
+    event_id: str = ""
+    task_id: str = ""
+    subtask_id: str | None = None
+    timestamp: float = Field(default_factory=time.time)
+    event_type: str = ""
+    phase: str = ""
+    tool: str | None = None
+    model: str | None = None
+    duration_ms: float | None = None
+    tokens: TokenUsage | None = None
+    cost_estimate: float | None = None
+    success: bool = True
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class TaskReport(BaseModel):
     task: str
     mode: str
@@ -119,3 +154,6 @@ class TaskReport(BaseModel):
     diagnoses: list[str] = Field(default_factory=list)
     fixes: list[str] = Field(default_factory=list)
     stop_reason: str = "completed"
+    trace_events: list[TraceEvent] = Field(default_factory=list)
+    total_tokens: TokenUsage | None = None
+    cost_estimate: float | None = None
