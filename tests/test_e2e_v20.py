@@ -205,7 +205,8 @@ class TestEndToEndPlannerIntegration:
             "Understood.",
             valid_plan,
             "Inspected.",
-            "Implemented.",
+            "Implemented subtask 1.",
+            "Implemented subtask 2.",
         )
         reviewer = ChatResponse(content=json.dumps({
             "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",

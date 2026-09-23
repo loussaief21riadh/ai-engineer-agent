@@ -25,7 +25,7 @@ class TaskPhase(str, Enum):
 VALID_TRANSITIONS: dict[TaskPhase, list[TaskPhase]] = {
     TaskPhase.UNDERSTAND: [TaskPhase.PLAN, TaskPhase.FAILED],
     TaskPhase.PLAN: [TaskPhase.INSPECT, TaskPhase.FAILED],
-    TaskPhase.INSPECT: [TaskPhase.IMPLEMENT, TaskPhase.TEST, TaskPhase.FAILED],
+    TaskPhase.INSPECT: [TaskPhase.IMPLEMENT, TaskPhase.TEST, TaskPhase.REPORT, TaskPhase.FAILED],
     TaskPhase.IMPLEMENT: [TaskPhase.TEST, TaskPhase.FAILED],
     TaskPhase.TEST: [TaskPhase.SECURITY_CHECK, TaskPhase.DIAGNOSE, TaskPhase.FAILED],
     TaskPhase.SECURITY_CHECK: [TaskPhase.REVIEW, TaskPhase.DIAGNOSE, TaskPhase.FAILED],

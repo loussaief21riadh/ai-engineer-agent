@@ -39,6 +39,14 @@ class BudgetTracker:
         self.start_time = time.monotonic()
         self._active = True
 
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore budget counters from a checkpoint snapshot without resetting."""
+        self.llm_calls = snapshot.get("llm_calls", 0)
+        self.tool_calls = snapshot.get("tool_calls", 0)
+        self.retry_cycles = snapshot.get("retry_cycles", 0)
+        self.start_time = time.monotonic()
+        self._active = True
+
     def stop(self) -> None:
         self._active = False
 

@@ -88,22 +88,26 @@ class TestReviewerIntegration:
         assert "echo hello" in prompt_content
 
     def test_review_result_in_task_report(self, mock_client):
-        agent_responses = _phase_responses("Understood.", "Plan ready.", "Inspected.", "Implemented.")
-        reviewer_response = ChatResponse(content=json.dumps({
+        agent_responses = _phase_responses("Understood.", "Plan ready.", "Inspected.", "Implemented.", "Fixed.")
+        reviewer_reject = ChatResponse(content=json.dumps({
             "approved": False,
             "findings": [{"severity": "critical", "category": "security", "description": "Exposed key"}],
             "summary": "Critical issues found.",
         }))
-        mock_client.chat.side_effect = agent_responses + [reviewer_response]
+        reviewer_approve = ChatResponse(content=json.dumps({
+            "approved": True,
+            "findings": [],
+            "summary": "Fixed.",
+        }))
+        mock_client.chat.side_effect = agent_responses + [reviewer_reject, reviewer_approve]
 
-        orch = _make_orch(mock_client)
+        orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
         report = orch.run_task("Check security")
 
         assert report.review is not None
-        assert report.review.approved is False
-        assert len(report.review.findings) == 1
-        assert report.review.findings[0].severity == ReviewSeverity.CRITICAL
-        assert report.review.summary == "Critical issues found."
+        assert report.review.approved is True
+        assert "FIX" in report.phase_history
+        assert "RETEST" in report.phase_history
 
     def test_reviewer_failure_safe(self, mock_client):
         agent_responses = _phase_responses("Understood.", "Plan ready.", "Inspected.", "Done.")

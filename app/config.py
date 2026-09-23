@@ -24,4 +24,7 @@ PROJECT_ROOT: Path = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().par
 AGENT_MODE: AgentMode = AgentMode(os.getenv("AGENT_MODE", "READ_ONLY"))
 MAX_AGENT_STEPS: int = int(os.getenv("MAX_AGENT_STEPS", "15"))
 MAX_RETRY_CYCLES: int = int(os.getenv("MAX_RETRY_CYCLES", "3"))
+MAX_REPLAN_COUNT: int = int(os.getenv("MAX_REPLAN_COUNT", "3"))
 COMMAND_TIMEOUT: int = int(os.getenv("COMMAND_TIMEOUT", "30"))
+CHECKPOINT_STALE_SECONDS: float = float(os.getenv("CHECKPOINT_STALE_SECONDS", "3600"))
+CHECKPOINT_SCHEMA_VERSION: int = 2

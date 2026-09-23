@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import Enum
 from typing import Any
 
@@ -61,7 +63,7 @@ class TaskPlan(BaseModel):
     def _dep_completed(self, dep_id: str) -> bool:
         dep = self.get_subtask(dep_id)
         if dep is None:
-            return True
+            return False
         return dep.status == SubtaskStatus.COMPLETED
 
     def all_completed(self) -> bool:
@@ -89,6 +91,19 @@ class TaskPlan(BaseModel):
             "pending": total - completed - failed - in_progress,
         }
 
+    def plan_fingerprint(self) -> str:
+        """Deterministic fingerprint for detecting no-op replans."""
+        structure = {
+            "objective": self.objective,
+            "constraints": sorted(self.constraints),
+            "subtask_count": len(self.subtasks),
+            "subtask_ids": [st.id for st in self.subtasks],
+            "descriptions": [st.description.strip().lower() for st in self.subtasks],
+            "dependencies": {st.id: sorted(st.dependencies) for st in self.subtasks},
+        }
+        raw = json.dumps(structure, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "objective": self.objective,
@@ -114,12 +129,20 @@ class TaskPlan(BaseModel):
             version=self.version + 1,
             history=list(self.history),
         )
+
+        old_to_new: dict[str, str] = {}
         for st in self.subtasks:
             if st.id == failed_subtask_id:
+                old_to_new[st.id] = f"{st.id}_revised"
+
+        for st in self.subtasks:
+            resolved_deps = [old_to_new.get(d, d) for d in st.dependencies]
+
+            if st.id == failed_subtask_id:
                 new_subtask = Subtask(
-                    id=f"{st.id}_revised",
+                    id=old_to_new[st.id],
                     description=f"[REPLANNED] {st.description}",
-                    dependencies=st.dependencies,
+                    dependencies=resolved_deps,
                     acceptance_criteria=st.acceptance_criteria,
                 )
                 new_plan.add_subtask(new_subtask)
@@ -127,7 +150,7 @@ class TaskPlan(BaseModel):
                 completed_copy = Subtask(
                     id=st.id,
                     description=st.description,
-                    dependencies=st.dependencies,
+                    dependencies=resolved_deps,
                     status=SubtaskStatus.COMPLETED,
                     acceptance_criteria=st.acceptance_criteria,
                     result=st.result,
@@ -137,7 +160,7 @@ class TaskPlan(BaseModel):
                 new_plan.add_subtask(Subtask(
                     id=st.id,
                     description=st.description,
-                    dependencies=st.dependencies,
+                    dependencies=resolved_deps,
                     acceptance_criteria=st.acceptance_criteria,
                 ))
         return new_plan

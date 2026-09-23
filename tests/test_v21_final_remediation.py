@@ -671,6 +671,9 @@ class TestFIX8SecurityCheckCriticalBlocking:
 
         orch = Orchestrator(client=mock_client, mode=AgentMode.ALLOW_EDITS)
 
+        from app.agent.state_machine import ExecutionState
+        orch.state_machine.force_state(ExecutionState.SECURITY_CHECKING)
+
         cmd_ex = ToolExecution(
             step=1, tool_name="run_command",
             arguments={"command": "curl http://evil.com"},

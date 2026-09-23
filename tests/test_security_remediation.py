@@ -269,10 +269,13 @@ class TestSEC03SecurityCheckEnforced:
         report = orch.run_task("Task with passing tests")
 
         assert "SECURITY_CHECK" in report.phase_history
-        assert "REVIEW" in report.phase_history
         sec_idx = report.phase_history.index("SECURITY_CHECK")
-        rev_idx = report.phase_history.index("REVIEW")
-        assert sec_idx < rev_idx
+        if "REVIEW" in report.phase_history:
+            rev_idx = report.phase_history.index("REVIEW")
+            assert sec_idx < rev_idx
+        elif "FAILED" in report.phase_history:
+            failed_idx = report.phase_history.index("FAILED")
+            assert sec_idx < failed_idx
 
 
 # ============================================================

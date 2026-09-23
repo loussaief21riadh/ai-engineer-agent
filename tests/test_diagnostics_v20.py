@@ -26,7 +26,7 @@ class TestErrorCategory:
         assert "UNKNOWN" in cats
 
     def test_category_count(self):
-        assert len(ErrorCategory) == 13
+        assert len(ErrorCategory) == 19
 
 
 class TestFailureDiagnosis:

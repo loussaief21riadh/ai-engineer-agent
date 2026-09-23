@@ -157,3 +157,10 @@ class TaskReport(BaseModel):
     trace_events: list[TraceEvent] = Field(default_factory=list)
     total_tokens: TokenUsage | None = None
     cost_estimate: float | None = None
+
+    completed_subtasks: list[str] = Field(default_factory=list)
+    failed_subtasks: list[str] = Field(default_factory=list)
+    blocked_subtasks: list[str] = Field(default_factory=list)
+    plan_versions: list[int] = Field(default_factory=list)
+    replan_count: int = 0
+    checkpoint_resume_used: bool = False
