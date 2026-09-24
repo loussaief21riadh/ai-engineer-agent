@@ -1345,6 +1345,108 @@ class TestReviewWorkflow:
         assert len(gate_evidence) > 0
         assert gate_evidence[0].success is False
 
+    def test_understand_records_deterministic_evidence(self):
+        mock_client = MagicMock()
+        orch = Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+        orch._run_agent_step = MagicMock(return_value="Understood.")
+        orch.context.transition_to("UNDERSTAND")
+        orch.state_machine.force_state(ExecutionState.UNDERSTANDING)
+
+        orch._phase_understand("Analyze project", [])
+
+        evidence = [e for e in orch.evidence_store if e.source == "project_analysis"]
+        assert len(evidence) == 1
+        assert evidence[0].evidence_type == EvidenceType.OBSERVATION
+        assert evidence[0].success is True
+        assert evidence[0].phase == "UNDERSTAND"
+        assert evidence[0].tool == "project_understanding"
+        assert "Languages" in evidence[0].payload_summary
+        assert "Modules" in evidence[0].payload_summary
+
+    def test_review_read_only_completes_with_deterministic_evidence(self):
+        mock_client = MagicMock()
+
+        def side_effect(*args, **kwargs):
+            msgs = kwargs.get("messages", [])
+            content = msgs[-1]["content"] if msgs else ""
+            if "Phase: UNDERSTAND" in content:
+                return ChatResponse(content="Understood.")
+            elif "Phase: PLAN" in content:
+                return ChatResponse(content=_make_plan_json(
+                    [{"id": "s1", "description": "analyze architecture", "dependencies": []}]
+                ))
+            elif "Phase: INSPECT" in content:
+                return ChatResponse(content="Analyzed. Architecture is clean.")
+            return ChatResponse(content="OK.")
+
+        mock_client.chat.side_effect = side_effect
+        orch = self._make_review_orch(mock_client, mode=AgentMode.READ_ONLY)
+
+        report = orch.run_task("Review this project in READ_ONLY mode. Inspect the codebase, identify potential issues, run relevant tests, and produce a structured engineering report. Do not modify any files.")
+
+        assert report.final_phase == "DONE"
+        assert "INSPECT" in report.phase_history
+        assert "REPORT" in report.phase_history
+        assert "IMPLEMENT" not in report.phase_history
+        evidence = [e for e in orch.evidence_store if e.source == "project_analysis"]
+        assert len(evidence) > 0
+
+    def test_gate_still_blocks_without_evidence(self):
+        gate = FinalValidationGate()
+        result = gate.validate(has_evidence=False)
+        assert result.overall_passed is False
+        failed = [r for r in result.results if not r.passed]
+        assert any(r.check.value == "EVIDENCE" for r in failed)
+
+    def test_review_read_only_blocks_on_critical_security(self):
+        mock_client = MagicMock()
+        orch = self._make_review_orch(mock_client)
+        orch._task_category = TaskCategory.REVIEW
+        orch._critical_security_findings = ["CRITICAL: secret exposed"]
+        orch.context.transition_to("REPORT")
+        orch.state_machine.force_state(ExecutionState.REPORTING)
+        orch.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="project_analysis",
+            phase="UNDERSTAND",
+            tool="project_understanding",
+            success=True,
+            payload_summary="Languages: 1, Modules: 10",
+        )
+
+        result = orch._phase_report("Analyze project", [])
+
+        assert result == TaskPhase.FAILED
+
+    def test_non_review_read_only_coding_unchanged(self):
+        mock_client = MagicMock()
+
+        def side_effect(*args, **kwargs):
+            msgs = kwargs.get("messages", [])
+            content = msgs[-1]["content"] if msgs else ""
+            if "Phase: UNDERSTAND" in content:
+                return ChatResponse(content="Understood.")
+            elif "Phase: PLAN" in content:
+                return ChatResponse(content=_make_plan_json(
+                    [{"id": "s1", "description": "implement feature", "dependencies": []}]
+                ))
+            return ChatResponse(content="Done.")
+
+        mock_client.chat.side_effect = side_effect
+        orch = Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+        mock_test = MagicMock()
+        mock_test.execute.return_value = {
+            "success": True,
+            "result": {"exit_code": 0, "stdout": "ok", "stderr": ""},
+        }
+        orch.core.tools["run_tests"] = mock_test
+
+        report = orch.run_task("Implement a new feature.")
+
+        assert report.final_phase == "FAILED"
+        assert "INSPECT" in report.phase_history
+        assert "IMPLEMENT" in report.phase_history
+
 
 class TestBudgetCommand:
     """Regression: /budget must not crash with KeyError."""

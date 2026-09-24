@@ -1230,6 +1230,17 @@ class Orchestrator:
             "modules": graph_summary["total_modules"],
         })
 
+        self.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="project_analysis",
+            phase="UNDERSTAND",
+            tool="project_understanding",
+            success=True,
+            payload_summary=f"Languages: {len(project_profile.languages)}, Modules: {graph_summary['total_modules']}, Import edges: {graph_summary['import_edges']}",
+            payload_detail={"languages": [l.name for l in project_profile.languages[:5]], "frameworks": project_profile.frameworks},
+            trust_level="TOOL_VERIFIED",
+        )
+
         self.context_budget.set_phase("UNDERSTAND")
         self.context_budget.add(ContextItem(
             content=f"Project: {project_profile.root_path}, Languages: {', '.join(l.name for l in project_profile.languages[:5])}",
