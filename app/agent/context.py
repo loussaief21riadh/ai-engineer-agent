@@ -42,6 +42,8 @@ class TaskContext(BaseModel):
     decisions: list[str] = Field(default_factory=list)
     iteration_count: int = 0
     retry_count: int = 0
+    change_decision: str = ""
+    assessment_retry_count: int = 0
 
     MAX_INSPECTED_FILES: int = 30
     MAX_OBSERVATIONS: int = 50

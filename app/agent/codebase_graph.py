@@ -53,10 +53,11 @@ class CodebaseGraph:
         self._build_test_mapping()
 
     def _scan_modules(self) -> None:
+        _skip = {".git", "__pycache__", ".venv", ".opencode", "node_modules"}
         for root, dirs, files in os.walk(self.root_path):
-            if ".git" in root or "__pycache__" in root or ".venv" in root:
+            dirs[:] = [d for d in dirs if d not in _skip]
+            if ".git" in root or "__pycache__" in root or ".venv" in root or ".opencode" in root:
                 continue
-            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".venv", "node_modules"}]
 
             for f in files:
                 if not f.endswith(".py"):

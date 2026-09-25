@@ -52,6 +52,25 @@ from app.tools.testing import RunTestsTool
 from app.tools.git import GitDiffTool, GitStatusTool
 from app.tools.ast_security import ASTSecurityAnalyzer
 
+from pydantic import BaseModel, Field
+
+INTENT_ANALYSIS = "ANALYSIS"
+INTENT_VERIFICATION = "VERIFICATION"
+INTENT_CORRECTION = "CORRECTION"
+INTENT_CREATION = "CREATION"
+INTENT_IMPROVEMENT = "IMPROVEMENT"
+
+MAX_ASSESSMENT_RETRIES = 2
+
+VALID_DECISIONS = {"NO_CHANGE_REQUIRED", "CHANGE_REQUIRED", "INSUFFICIENT_EVIDENCE"}
+
+
+class InspectionAssessment(BaseModel):
+    decision: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+    evidence: list[str] = Field(default_factory=list)
+
 
 def _build_report_from_executions(
     task: str,
@@ -1346,6 +1365,223 @@ class Orchestrator:
         self.exec_trace.finish_span(self.exec_trace._spans[-1])
         return self._advance(TaskPhase.PLAN, TaskPhase.INSPECT, phase_history)
 
+    def _classify_intent(self, task: str, category: TaskCategory | None) -> str:
+        lower = task.lower()
+
+        if category == TaskCategory.DEBUGGING:
+            return INTENT_CORRECTION
+
+        if category == TaskCategory.REASONING:
+            return INTENT_ANALYSIS
+
+        if category == TaskCategory.PLANNING:
+            return INTENT_ANALYSIS
+
+        if any(kw in lower for kw in ["check whether", "verify", "confirm", "is it correct"]):
+            return INTENT_VERIFICATION
+
+        if any(kw in lower for kw in ["fix", "debug", "error", "bug", "fail", "broken", "crash"]):
+            return INTENT_CORRECTION
+
+        if any(kw in lower for kw in ["improve", "enhance", "optimize", "refactor", "upgrade"]):
+            return INTENT_IMPROVEMENT
+
+        if any(kw in lower for kw in ["add", "create", "implement", "build", "develop"]):
+            return INTENT_CREATION
+
+        if any(kw in lower for kw in ["explain", "how does", "why does", "what is", "analyze"]):
+            return INTENT_ANALYSIS
+
+        if category == TaskCategory.REVIEW:
+            return INTENT_VERIFICATION
+
+        return INTENT_ANALYSIS
+
+    def _parse_inspect_assessment(self, raw_response: str) -> InspectionAssessment:
+        text = raw_response.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            text = "\n".join(lines)
+
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return InspectionAssessment(
+                decision="INSUFFICIENT_EVIDENCE",
+                confidence=0.0,
+                reason=f"Invalid JSON in assessment response",
+                evidence=[],
+            )
+
+        if not isinstance(data, dict):
+            return InspectionAssessment(
+                decision="INSUFFICIENT_EVIDENCE",
+                confidence=0.0,
+                reason="Assessment response is not a JSON object",
+                evidence=[],
+            )
+
+        decision = data.get("decision", "")
+        if decision not in VALID_DECISIONS:
+            return InspectionAssessment(
+                decision="INSUFFICIENT_EVIDENCE",
+                confidence=0.0,
+                reason=f"Unknown decision '{decision}', valid: {sorted(VALID_DECISIONS)}",
+                evidence=[],
+            )
+
+        confidence = data.get("confidence", 0.0)
+        if not isinstance(confidence, (int, float)) or confidence < 0.0 or confidence > 1.0:
+            confidence = 0.0
+
+        evidence = data.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = []
+        evidence = [str(e) for e in evidence if e]
+
+        reason = data.get("reason", "")
+        if not isinstance(reason, str) or not reason.strip():
+            reason = "No reason provided"
+
+        return InspectionAssessment(
+            decision=decision,
+            confidence=confidence,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    def _assess_change_required(self, task: str) -> str:
+        raw_response = self._get_final_response()
+        assessment = self._parse_inspect_assessment(raw_response)
+        intent = self._classify_intent(task, self._task_category)
+
+        overridden = False
+        override_reason = ""
+
+        if intent == INTENT_CORRECTION:
+            if self.context.test_results is not None and not self.context.test_results.get("success", False):
+                if assessment.decision == "NO_CHANGE_REQUIRED":
+                    assessment.decision = "CHANGE_REQUIRED"
+                    overridden = True
+                    override_reason = "tests are failing"
+
+        if intent in (INTENT_CREATION, INTENT_IMPROVEMENT):
+            if assessment.decision == "NO_CHANGE_REQUIRED" and assessment.confidence < 0.7:
+                assessment.decision = "INSUFFICIENT_EVIDENCE"
+                overridden = True
+                override_reason = f"confidence {assessment.confidence:.2f} < 0.7 for {intent}"
+
+        if assessment.decision == "NO_CHANGE_REQUIRED" and not self.context.inspected_files:
+            assessment.decision = "INSUFFICIENT_EVIDENCE"
+            overridden = True
+            override_reason = "no files were inspected"
+
+        self.context.change_decision = assessment.decision
+
+        trust = "SYSTEM_DERIVED" if overridden else "MODEL_INFERRED"
+        self.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="change_assessment",
+            phase="INSPECT",
+            tool="orchestrator",
+            success=True,
+            payload_summary=f"decision={assessment.decision}, confidence={assessment.confidence:.2f}, intent={intent}",
+            payload_detail={
+                "decision": assessment.decision,
+                "confidence": assessment.confidence,
+                "reason": assessment.reason,
+                "evidence": assessment.evidence,
+                "intent": intent,
+                "overridden": overridden,
+                "override_reason": override_reason,
+            },
+            trust_level=trust,
+        )
+        self.context.add_observation(
+            f"Change assessment: {assessment.decision} "
+            f"(confidence={assessment.confidence:.2f}, intent={intent}"
+            f"{', override: ' + override_reason if overridden else ''})"
+            f" — {assessment.reason}",
+            trust=TrustLevel(trust),
+        )
+
+        return assessment.decision
+
+    def _handle_insufficient_evidence(self, task: str, phase_history: list[str]) -> TaskPhase:
+        self.context.assessment_retry_count += 1
+
+        if self.context.assessment_retry_count > MAX_ASSESSMENT_RETRIES:
+            self.context.add_observation(
+                f"INSUFFICIENT_EVIDENCE after {MAX_ASSESSMENT_RETRIES} assessment attempts. "
+                "Proceeding to REPORT with findings.",
+                trust=TrustLevel.SYSTEM_DERIVED,
+            )
+            self.evidence_store.record(
+                evidence_type=EvidenceType.OBSERVATION,
+                source="assessment_retry_limit",
+                phase="INSPECT",
+                tool="orchestrator",
+                success=True,
+                payload_summary=(
+                    f"Max assessment retries ({MAX_ASSESSMENT_RETRIES}) reached. "
+                    f"Inspected files: {sorted(self.context.inspected_files.keys())}"
+                ),
+                trust_level="SYSTEM_DERIVED",
+            )
+            return self._advance(TaskPhase.INSPECT, TaskPhase.REPORT, phase_history)
+
+        raw_response = self._get_final_response()
+        assessment = self._parse_inspect_assessment(raw_response)
+        previous_reason = assessment.reason
+
+        self.context.add_observation(
+            f"INSUFFICIENT_EVIDENCE (attempt {self.context.assessment_retry_count}/{MAX_ASSESSMENT_RETRIES}). "
+            "Performing additional focused inspection.",
+            trust=TrustLevel.SYSTEM_DERIVED,
+        )
+        self.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="assessment_retry",
+            phase="INSPECT",
+            tool="orchestrator",
+            success=True,
+            payload_summary=f"Re-inspection attempt {self.context.assessment_retry_count}",
+            trust_level="SYSTEM_DERIVED",
+        )
+
+        self.context.transition_to("INSPECT")
+        self.exec_trace.start_span("phase_inspect_retry", category="phase")
+
+        budget_ctx = self._get_budget_context()
+        prompt = self.context_builder.build_phase_prompt(
+            self.context, "INSPECT", task, memory_context=self._get_memory_context()
+        )
+        if budget_ctx:
+            prompt += f"\n\n{budget_ctx}\n"
+        prompt += (
+            "\nThe previous inspection could not determine whether the requested task is satisfied.\n\n"
+            f"Previous assessment: INSUFFICIENT_EVIDENCE\n"
+            f"Previous reason: {previous_reason}\n\n"
+            "Perform a focused additional inspection specifically targeting the missing evidence. "
+            "Do not repeat the previous inspection unnecessarily.\n\n"
+            "After gathering additional evidence, respond with a JSON object (no markdown, no code fences) containing:\n"
+            '- "decision": one of "NO_CHANGE_REQUIRED", "CHANGE_REQUIRED", or "INSUFFICIENT_EVIDENCE"\n'
+            '- "confidence": a number between 0.0 and 1.0\n'
+            '- "reason": a brief explanation of your decision\n'
+            '- "evidence": a list of file paths or observations supporting your decision'
+        )
+        self._run_agent_step(prompt, model=self._selected_model)
+        self.exec_trace.finish_span(self.exec_trace._spans[-1])
+
+        decision = self._assess_change_required(task)
+
+        if decision == "NO_CHANGE_REQUIRED":
+            return self._advance(TaskPhase.INSPECT, TaskPhase.REPORT, phase_history)
+        if decision == "INSUFFICIENT_EVIDENCE":
+            return self._handle_insufficient_evidence(task, phase_history)
+        return self._advance(TaskPhase.INSPECT, TaskPhase.IMPLEMENT, phase_history)
+
     def _phase_inspect(
         self, task: str, phase_history: list[str]
     ) -> TaskPhase:
@@ -1379,12 +1615,38 @@ class Orchestrator:
         if budget_ctx:
             prompt += f"\n\n{budget_ctx}\n"
         prompt += (
-            "\n\nRead the relevant files. Understand the current code before making changes."
+            "\n\nRead the relevant files. Understand the current code before making changes.\n\n"
+            "After inspection, respond with a JSON object (no markdown, no code fences) containing:\n"
+            '- "decision": one of "NO_CHANGE_REQUIRED", "CHANGE_REQUIRED", or "INSUFFICIENT_EVIDENCE"\n'
+            '- "confidence": a number between 0.0 and 1.0\n'
+            '- "reason": a brief explanation of your decision\n'
+            '- "evidence": a list of file paths or observations supporting your decision\n\n'
+            "Rules:\n"
+            "- NO_CHANGE_REQUIRED: the requested task is already satisfied by the current project state\n"
+            "- CHANGE_REQUIRED: the requested task is not satisfied and modifications are required\n"
+            "- INSUFFICIENT_EVIDENCE: you cannot determine with confidence whether the task is satisfied\n"
+            "- Base your decision on the actual file contents you inspected, not assumptions\n"
+            "- For verification tasks, NO_CHANGE_REQUIRED means the verified condition is correct\n"
+            "- For correction tasks, NO_CHANGE_REQUIRED means the reported defect is not actually present\n"
+            "- Do not assume that a generally healthy project satisfies a specific requested task"
         )
         self._run_agent_step(prompt, model=self._selected_model)
         self.exec_trace.finish_span(self.exec_trace._spans[-1])
+
         if self._task_category == TaskCategory.REVIEW and self.mode == AgentMode.READ_ONLY:
             return self._advance(TaskPhase.INSPECT, TaskPhase.REPORT, phase_history)
+
+        decision = self._assess_change_required(task)
+
+        if decision == "NO_CHANGE_REQUIRED":
+            return self._advance(TaskPhase.INSPECT, TaskPhase.REPORT, phase_history)
+
+        if decision == "INSUFFICIENT_EVIDENCE":
+            return self._handle_insufficient_evidence(task, phase_history)
+
+        if self.mode == AgentMode.READ_ONLY:
+            return self._advance(TaskPhase.INSPECT, TaskPhase.REPORT, phase_history)
+
         return self._advance(TaskPhase.INSPECT, TaskPhase.IMPLEMENT, phase_history)
 
     def _phase_implement(
@@ -2058,14 +2320,19 @@ class Orchestrator:
         self.context.transition_to("REPORT")
 
         is_review_task = self._task_category == TaskCategory.REVIEW
+        is_no_change = self.context.change_decision == "NO_CHANGE_REQUIRED"
 
         has_test_results = self.context.test_results is not None
         tests_passed = has_test_results and self.context.test_results.get("success", False)
         if is_review_task and not has_test_results:
             tests_passed = True
+        if is_no_change and not has_test_results:
+            tests_passed = True
 
         has_review = self._last_review_result is not None and self._last_review_result.approved
         if is_review_task:
+            has_review = True
+        if is_no_change:
             has_review = True
 
         gate_result = self.validation_gate.validate(

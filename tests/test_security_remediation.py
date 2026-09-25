@@ -21,6 +21,13 @@ from app.models.schemas import ExecutionEvidence, ReviewVerdict, ToolExecution
 from app.tools.base import BaseTool, ToolSchema
 from app.tools.terminal import _validate_command, _extract_git_subcommand
 
+_CHANGE_REQUIRED_RESPONSE = json.dumps({
+    "decision": "CHANGE_REQUIRED",
+    "confidence": 0.95,
+    "reason": "Inspection identified work required for the requested task.",
+    "evidence": ["inspection completed"],
+})
+
 
 class MockReadFileTool(BaseTool):
     @property
@@ -188,7 +195,7 @@ class TestSEC02ReviewerBudgetTracking:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -232,7 +239,7 @@ class TestSEC03SecurityCheckEnforced:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         mock_client.chat.side_effect = responses
@@ -250,7 +257,7 @@ class TestSEC03SecurityCheckEnforced:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -461,7 +468,7 @@ class TestSEC06MemoryRuntimeIntegration:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -503,7 +510,7 @@ class TestSEC06MemoryRuntimeIntegration:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -589,7 +596,7 @@ class TestSEC07ExecutionEvidenceIntegration:
         responses = [
             ChatResponse(content="I fixed the bug in app/main.py."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Done."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -615,7 +622,7 @@ class TestSEC07ExecutionEvidenceIntegration:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({

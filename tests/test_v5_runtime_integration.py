@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.agent.context import TaskContext
 from app.agent.evidence import EvidenceStore, EvidenceType, EvidenceStatus
 from app.agent.execution_controller import ExecutionController, SubtaskLifecycle
 from app.agent.regression import RegressionEngine, RegressionSeverity
@@ -33,6 +34,7 @@ from app.agent.phases import TaskPhase
 from app.agent.router import TaskCategory
 from app.config import AgentMode
 from app.llm.openrouter import ChatResponse
+from app.models.schemas import ReviewResult, ReviewVerdict
 
 
 def _make_plan_json(subtasks=None):
@@ -61,6 +63,14 @@ def _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS):
     return orch
 
 
+_CHANGE_REQUIRED_RESPONSE = json.dumps({
+    "decision": "CHANGE_REQUIRED",
+    "confidence": 0.95,
+    "reason": "Inspection identified work required for the requested task.",
+    "evidence": ["inspection completed"],
+})
+
+
 def _default_side_effect(*args, **kwargs):
     msgs = kwargs.get("messages", [])
     if not msgs:
@@ -73,7 +83,7 @@ def _default_side_effect(*args, **kwargs):
     elif "Phase: PLAN" in content:
         return ChatResponse(content=_make_plan_json())
     elif "Phase: INSPECT" in content:
-        return ChatResponse(content="Inspected.")
+        return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
     elif "Phase: IMPLEMENT" in content:
         return ChatResponse(content="Implemented.")
     else:
@@ -276,7 +286,7 @@ class TestSelfReflectionIntegration:
             elif "Phase: PLAN" in content:
                 return ChatResponse(content=_make_plan_json())
             elif "Phase: INSPECT" in content:
-                return ChatResponse(content="Inspected.")
+                return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
             elif "Phase: IMPLEMENT" in content:
                 return ChatResponse(content="Implemented.")
             elif "Phase: DIAGNOSE" in content:
@@ -462,7 +472,7 @@ class TestFullChainIntegration:
             elif "Phase: PLAN" in content:
                 return ChatResponse(content=_make_plan_json())
             elif "Phase: INSPECT" in content:
-                return ChatResponse(content="Inspected.")
+                return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
             elif "Phase: IMPLEMENT" in content:
                 return ChatResponse(content="Implemented.")
             elif "Phase: DIAGNOSE" in content:
@@ -529,7 +539,7 @@ class TestV5RuntimeWiring:
             elif "Phase: PLAN" in content:
                 return ChatResponse(content=plan)
             elif "Phase: INSPECT" in content:
-                return ChatResponse(content="Inspected.")
+                return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
             elif "Phase: IMPLEMENT" in content:
                 return ChatResponse(content="Implemented.")
             elif "review" in content.lower():
@@ -1246,7 +1256,12 @@ class TestReviewWorkflow:
         orch._task_category = TaskCategory.CODING
         orch.context.transition_to("INSPECT")
         orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
         orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "CHANGE_REQUIRED", "confidence": 0.95,
+            "reason": "Work needed", "evidence": ["app/main.py"],
+        }))
 
         result = orch._phase_inspect("Implement a feature", [])
 
@@ -1258,7 +1273,12 @@ class TestReviewWorkflow:
         orch._task_category = TaskCategory.REVIEW
         orch.context.transition_to("INSPECT")
         orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
         orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "CHANGE_REQUIRED", "confidence": 0.95,
+            "reason": "Work needed", "evidence": ["app/main.py"],
+        }))
 
         result = orch._phase_inspect("Review the code", [])
 
@@ -1430,6 +1450,8 @@ class TestReviewWorkflow:
                 return ChatResponse(content=_make_plan_json(
                     [{"id": "s1", "description": "implement feature", "dependencies": []}]
                 ))
+            elif "Phase: INSPECT" in content:
+                return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
             return ChatResponse(content="Done.")
 
         mock_client.chat.side_effect = side_effect
@@ -1443,9 +1465,9 @@ class TestReviewWorkflow:
 
         report = orch.run_task("Implement a new feature.")
 
-        assert report.final_phase == "FAILED"
         assert "INSPECT" in report.phase_history
-        assert "IMPLEMENT" in report.phase_history
+        assert "REPORT" in report.phase_history
+        assert "IMPLEMENT" not in report.phase_history
 
 
 class TestBudgetCommand:
@@ -1482,3 +1504,642 @@ class TestBudgetCommand:
             tracker.record_llm_call()
 
         assert tracker.budget_violation() is not None
+
+
+class TestNoChangeParsing:
+    """Tests for _parse_inspect_assessment structured output parsing."""
+
+    def _make_orch(self):
+        mock_client = MagicMock()
+        return Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+
+    def test_parse_valid_no_change(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.92,
+            "reason": "Authentication already exists and satisfies the task.",
+            "evidence": ["app/auth.py", "tests/test_auth.py"],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "NO_CHANGE_REQUIRED"
+        assert result.confidence == 0.92
+        assert "Authentication" in result.reason
+        assert len(result.evidence) == 2
+
+    def test_parse_valid_change_required(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "CHANGE_REQUIRED",
+            "confidence": 0.88,
+            "reason": "Tests are failing and need fixes.",
+            "evidence": ["tests/test_auth.py"],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "CHANGE_REQUIRED"
+        assert result.confidence == 0.88
+
+    def test_parse_valid_insufficient(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "INSUFFICIENT_EVIDENCE",
+            "confidence": 0.3,
+            "reason": "Cannot determine if implementation is correct.",
+            "evidence": [],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "INSUFFICIENT_EVIDENCE"
+
+    def test_parse_invalid_json(self):
+        orch = self._make_orch()
+        result = orch._parse_inspect_assessment("This is not JSON at all")
+        assert result.decision == "INSUFFICIENT_EVIDENCE"
+        assert result.confidence == 0.0
+
+    def test_parse_missing_decision(self):
+        orch = self._make_orch()
+        raw = json.dumps({"confidence": 0.5, "reason": "test", "evidence": []})
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "INSUFFICIENT_EVIDENCE"
+
+    def test_parse_unknown_decision(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "MAYBE",
+            "confidence": 0.5,
+            "reason": "test",
+            "evidence": [],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "INSUFFICIENT_EVIDENCE"
+
+    def test_parse_invalid_confidence_negative(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": -0.5,
+            "reason": "test",
+            "evidence": [],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.confidence == 0.0
+        assert result.decision == "NO_CHANGE_REQUIRED"
+
+    def test_parse_invalid_confidence_string(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": "high",
+            "reason": "test",
+            "evidence": [],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.confidence == 0.0
+
+    def test_parse_missing_evidence(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "reason": "test",
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.evidence == []
+
+    def test_parse_missing_reason(self):
+        orch = self._make_orch()
+        raw = json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "evidence": [],
+        })
+        result = orch._parse_inspect_assessment(raw)
+        assert result.reason == "No reason provided"
+
+    def test_parse_markdown_fences(self):
+        orch = self._make_orch()
+        raw = '```json\n{"decision": "NO_CHANGE_REQUIRED", "confidence": 0.9, "reason": "ok", "evidence": []}\n```'
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "NO_CHANGE_REQUIRED"
+        assert result.confidence == 0.9
+
+    def test_parse_not_a_dict(self):
+        orch = self._make_orch()
+        raw = json.dumps(["not", "a", "dict"])
+        result = orch._parse_inspect_assessment(raw)
+        assert result.decision == "INSUFFICIENT_EVIDENCE"
+
+
+class TestNoChangeIntentClassification:
+    """Tests for _classify_intent deterministic classification."""
+
+    def _make_orch(self):
+        mock_client = MagicMock()
+        return Orchestrator(client=mock_client, mode=AgentMode.READ_ONLY)
+
+    def test_debugging_returns_correction(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Fix the bug", TaskCategory.DEBUGGING) == "CORRECTION"
+
+    def test_reasoning_returns_analysis(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Why does this fail", TaskCategory.REASONING) == "ANALYSIS"
+
+    def test_planning_returns_analysis(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Plan the refactor", TaskCategory.PLANNING) == "ANALYSIS"
+
+    def test_verify_keyword(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Verify the authentication", TaskCategory.REVIEW) == "VERIFICATION"
+
+    def test_check_whether_keyword(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Check whether login works", TaskCategory.SIMPLE) == "VERIFICATION"
+
+    def test_fix_keyword(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Fix the failing tests", TaskCategory.CODING) == "CORRECTION"
+
+    def test_improve_keyword(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Improve the logging system", TaskCategory.CODING) == "IMPROVEMENT"
+
+    def test_add_keyword(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Add authentication module", TaskCategory.CODING) == "CREATION"
+
+    def test_explain_keyword(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Explain the architecture", TaskCategory.SIMPLE) == "ANALYSIS"
+
+    def test_review_category_returns_verification(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Review this code", TaskCategory.REVIEW) == "VERIFICATION"
+
+    def test_default_simple_returns_analysis(self):
+        orch = self._make_orch()
+        assert orch._classify_intent("Do something", TaskCategory.SIMPLE) == "ANALYSIS"
+
+
+class TestNoChangeRouting:
+    """Tests for _phase_inspect routing based on assessment."""
+
+    def _make_orch(self, mock_client, mode=AgentMode.READ_ONLY):
+        orch = Orchestrator(client=mock_client, mode=mode)
+        mock_test = MagicMock()
+        mock_test.execute.return_value = {
+            "success": True,
+            "result": {"exit_code": 0, "stdout": "ok", "stderr": ""},
+        }
+        orch.core.tools["run_tests"] = mock_test
+        return orch
+
+    def _make_assessment_response(self, decision, confidence=0.9, reason="ok", evidence=None):
+        return json.dumps({
+            "decision": decision,
+            "confidence": confidence,
+            "reason": reason,
+            "evidence": evidence or ["app/main.py"],
+        })
+
+    def test_no_change_skips_implement(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("NO_CHANGE_REQUIRED")
+        )
+
+        result = orch._phase_inspect("Add authentication", [])
+
+        assert result == TaskPhase.REPORT
+        assert orch.context.change_decision == "NO_CHANGE_REQUIRED"
+
+    def test_change_required_allow_edits_routes_implement(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("CHANGE_REQUIRED")
+        )
+
+        result = orch._phase_inspect("Add authentication", [])
+
+        assert result == TaskPhase.IMPLEMENT
+
+    def test_change_required_read_only_routes_report(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("CHANGE_REQUIRED")
+        )
+
+        result = orch._phase_inspect("Add authentication", [])
+
+        assert result == TaskPhase.REPORT
+
+    def test_change_required_routing_matrix(self):
+        mock_client = MagicMock()
+
+        orch_re = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch_re._task_category = TaskCategory.CODING
+        orch_re.context.transition_to("INSPECT")
+        orch_re.state_machine.force_state(ExecutionState.INSPECTING)
+        orch_re.context.record_inspected_file("app/main.py", "content")
+        orch_re._run_agent_step = MagicMock(return_value="Inspected.")
+        orch_re._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("CHANGE_REQUIRED")
+        )
+        result_re = orch_re._phase_inspect("Add authentication", [])
+        assert result_re == TaskPhase.REPORT, "CHANGE_REQUIRED + READ_ONLY must route to REPORT"
+
+        orch_ae = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch_ae._task_category = TaskCategory.CODING
+        orch_ae.context.transition_to("INSPECT")
+        orch_ae.state_machine.force_state(ExecutionState.INSPECTING)
+        orch_ae.context.record_inspected_file("app/main.py", "content")
+        orch_ae._run_agent_step = MagicMock(return_value="Inspected.")
+        orch_ae._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("CHANGE_REQUIRED")
+        )
+        result_ae = orch_ae._phase_inspect("Add authentication", [])
+        assert result_ae == TaskPhase.IMPLEMENT, "CHANGE_REQUIRED + ALLOW_EDITS must route to IMPLEMENT"
+
+        orch_nc = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch_nc._task_category = TaskCategory.CODING
+        orch_nc.context.transition_to("INSPECT")
+        orch_nc.state_machine.force_state(ExecutionState.INSPECTING)
+        orch_nc.context.record_inspected_file("app/main.py", "content")
+        orch_nc._run_agent_step = MagicMock(return_value="Inspected.")
+        orch_nc._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("NO_CHANGE_REQUIRED")
+        )
+        result_nc = orch_nc._phase_inspect("Add authentication", [])
+        assert result_nc == TaskPhase.REPORT, "NO_CHANGE_REQUIRED + READ_ONLY must route to REPORT"
+
+    def test_review_read_only_unchanged(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.REVIEW
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+
+        result = orch._phase_inspect("Analyze the project", [])
+
+        assert result == TaskPhase.REPORT
+
+    def test_insufficient_evidence_reinspect(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.REVIEW
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        call_count = [0]
+        def _mock_get_final_response():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return self._make_assessment_response("INSUFFICIENT_EVIDENCE", confidence=0.3)
+            return self._make_assessment_response("CHANGE_REQUIRED", confidence=0.9)
+        orch._get_final_response = MagicMock(side_effect=_mock_get_final_response)
+
+        result = orch._phase_inspect("Check authentication", [])
+
+        assert result == TaskPhase.IMPLEMENT
+        assert orch.context.assessment_retry_count == 1
+        assert orch.context.change_decision == "CHANGE_REQUIRED"
+
+    def test_insufficient_exhausted_routes_report(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.REVIEW
+        orch.context.assessment_retry_count = 2
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(
+            return_value=self._make_assessment_response("INSUFFICIENT_EVIDENCE", confidence=0.3)
+        )
+
+        result = orch._handle_insufficient_evidence("Check auth", [])
+
+        assert result == TaskPhase.REPORT
+
+
+class TestNoChangeStateAndGuards:
+    """Tests for context state, evidence recording, and system guards."""
+
+    def _make_orch(self, mock_client, mode=AgentMode.READ_ONLY):
+        orch = Orchestrator(client=mock_client, mode=mode)
+        mock_test = MagicMock()
+        mock_test.execute.return_value = {
+            "success": True,
+            "result": {"exit_code": 0, "stdout": "ok", "stderr": ""},
+        }
+        orch.core.tools["run_tests"] = mock_test
+        return orch
+
+    def test_no_change_recorded_in_context(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "reason": "Already implemented.",
+            "evidence": ["app/main.py"],
+        }))
+
+        orch._phase_inspect("Add auth", [])
+
+        assert orch.context.change_decision == "NO_CHANGE_REQUIRED"
+
+    def test_assessment_evidence_recorded(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "reason": "Already implemented.",
+            "evidence": ["app/main.py"],
+        }))
+
+        orch._phase_inspect("Add auth", [])
+
+        assessments = [e for e in orch.evidence_store if e.source == "change_assessment"]
+        assert len(assessments) == 1
+        assert assessments[0].phase == "INSPECT"
+        assert "NO_CHANGE_REQUIRED" in assessments[0].payload_summary
+
+    def test_retry_counter_increments(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.REVIEW
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        call_count = [0]
+        def _mock_get_final_response():
+            call_count[0] += 1
+            if call_count[0] <= 3:
+                return json.dumps({
+                    "decision": "INSUFFICIENT_EVIDENCE",
+                    "confidence": 0.3,
+                    "reason": "Not sure.",
+                    "evidence": [],
+                })
+            return json.dumps({
+                "decision": "CHANGE_REQUIRED",
+                "confidence": 0.9,
+                "reason": "Now I see it.",
+                "evidence": ["app/main.py"],
+            })
+        orch._get_final_response = MagicMock(side_effect=_mock_get_final_response)
+
+        orch._phase_inspect("Check auth", [])
+
+        assert orch.context.assessment_retry_count == 2
+        assert orch.context.change_decision == "CHANGE_REQUIRED"
+
+    def test_retry_counter_resets_for_new_task(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch.context.assessment_retry_count = 5
+        orch.context.change_decision = "NO_CHANGE_REQUIRED"
+        mock_client.chat.side_effect = _default_side_effect
+
+        orch.run_task("Do something")
+
+        assert orch.context.assessment_retry_count <= 2
+        assert orch.context.change_decision != "NO_CHANGE_REQUIRED"
+
+    def test_retry_counter_survives_checkpoint(self):
+        from app.agent.checkpoint import Checkpoint
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch.context.assessment_retry_count = 1
+        orch.context.change_decision = "INSUFFICIENT_EVIDENCE"
+
+        snapshot = orch.context.model_dump()
+        restored = TaskContext(**snapshot)
+
+        assert restored.assessment_retry_count == 1
+        assert restored.change_decision == "INSUFFICIENT_EVIDENCE"
+
+    def test_no_inspected_files_prevents_no_change(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "reason": "Looks good.",
+            "evidence": [],
+        }))
+
+        result = orch._phase_inspect("Add auth", [])
+
+        assert orch.context.change_decision == "INSUFFICIENT_EVIDENCE"
+        assert result == TaskPhase.REPORT
+
+    def test_guard_debugging_tests_fail_override(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.DEBUGGING
+        orch.context.test_results = {"success": False, "stdout": "FAILED"}
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "reason": "No issues found.",
+            "evidence": ["app/main.py"],
+        }))
+
+        orch._phase_inspect("Fix the failing tests", [])
+
+        assert orch.context.change_decision == "CHANGE_REQUIRED"
+
+    def test_guard_creation_low_confidence(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.4,
+            "reason": "Maybe it exists?",
+            "evidence": ["app/main.py"],
+        }))
+
+        orch._phase_inspect("Add authentication", [])
+
+        assert orch.context.change_decision == "INSUFFICIENT_EVIDENCE"
+
+    def test_model_evidence_not_tool_verified(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
+        orch._task_category = TaskCategory.CODING
+        orch.context.transition_to("INSPECT")
+        orch.state_machine.force_state(ExecutionState.INSPECTING)
+        orch.context.record_inspected_file("app/main.py", "content")
+        orch._run_agent_step = MagicMock(return_value="Inspected.")
+        orch._get_final_response = MagicMock(return_value=json.dumps({
+            "decision": "NO_CHANGE_REQUIRED",
+            "confidence": 0.9,
+            "reason": "Already done.",
+            "evidence": ["app/main.py"],
+        }))
+
+        orch._phase_inspect("Add auth", [])
+
+        assessments = [e for e in orch.evidence_store if e.source == "change_assessment"]
+        assert len(assessments) == 1
+        assert assessments[0].trust_level == "MODEL_INFERRED"
+
+
+class TestNoChangeGate:
+    """Tests for FinalValidationGate compatibility with NO_CHANGE."""
+
+    def _make_orch(self, mock_client, mode=AgentMode.READ_ONLY):
+        orch = Orchestrator(client=mock_client, mode=mode)
+        mock_test = MagicMock()
+        mock_test.execute.return_value = {
+            "success": True,
+            "result": {"exit_code": 0, "stdout": "ok", "stderr": ""},
+        }
+        orch.core.tools["run_tests"] = mock_test
+        return orch
+
+    def test_no_change_gate_passes_no_test_results(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.CODING
+        orch.context.change_decision = "NO_CHANGE_REQUIRED"
+        orch.context.transition_to("REPORT")
+        orch.state_machine.force_state(ExecutionState.REPORTING)
+        orch.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="inspect",
+            phase="INSPECT",
+            tool="orchestrator",
+            success=True,
+            payload_summary="Analysis complete",
+        )
+
+        result = orch._phase_report("Analyze project", [])
+
+        assert result == TaskPhase.DONE
+
+    def test_no_change_gate_passes_no_review(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.CODING
+        orch.context.change_decision = "NO_CHANGE_REQUIRED"
+        orch._last_review_result = None
+        orch.context.transition_to("REPORT")
+        orch.state_machine.force_state(ExecutionState.REPORTING)
+        orch.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="inspect",
+            phase="INSPECT",
+            tool="orchestrator",
+            success=True,
+            payload_summary="Analysis complete",
+        )
+
+        result = orch._phase_report("Analyze project", [])
+
+        assert result == TaskPhase.DONE
+
+    def test_no_change_still_requires_evidence(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.CODING
+        orch.context.change_decision = "NO_CHANGE_REQUIRED"
+        orch.context.transition_to("REPORT")
+        orch.state_machine.force_state(ExecutionState.REPORTING)
+
+        result = orch._phase_report("Analyze project", [])
+
+        assert result == TaskPhase.FAILED
+
+    def test_no_change_does_not_bypass_security(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.CODING
+        orch.context.change_decision = "NO_CHANGE_REQUIRED"
+        orch._critical_security_findings = ["CRITICAL: secret in config.py"]
+        orch.context.transition_to("REPORT")
+        orch.state_machine.force_state(ExecutionState.REPORTING)
+        orch.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="inspect",
+            phase="INSPECT",
+            tool="orchestrator",
+            success=True,
+            payload_summary="Analysis complete",
+        )
+
+        result = orch._phase_report("Analyze project", [])
+
+        assert result == TaskPhase.FAILED
+
+    def test_change_required_still_follows_normal_path(self):
+        mock_client = MagicMock()
+        orch = self._make_orch(mock_client, mode=AgentMode.READ_ONLY)
+        orch._task_category = TaskCategory.CODING
+        orch.context.change_decision = "CHANGE_REQUIRED"
+        orch.context.test_results = {"success": True, "exit_code": 0}
+        orch._last_review_result = ReviewResult(
+            approved=True, findings=[], summary="LGTM", verdict=ReviewVerdict.APPROVE,
+        )
+        orch.context.transition_to("REPORT")
+        orch.state_machine.force_state(ExecutionState.REPORTING)
+        orch.evidence_store.record(
+            evidence_type=EvidenceType.OBSERVATION,
+            source="implement",
+            phase="IMPLEMENT",
+            tool="orchestrator",
+            success=True,
+            payload_summary="Changes applied",
+        )
+
+        result = orch._phase_report("Add auth", [])
+
+        assert result == TaskPhase.DONE

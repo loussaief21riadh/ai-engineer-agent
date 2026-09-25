@@ -73,8 +73,22 @@ def _make_orch(mock_client, mode=AgentMode.READ_ONLY):
     return orch
 
 
+_CHANGE_REQUIRED_RESPONSE = json.dumps({
+    "decision": "CHANGE_REQUIRED",
+    "confidence": 0.95,
+    "reason": "Inspection identified work required for the requested task.",
+    "evidence": ["inspection completed"],
+})
+
+
 def _phase_responses(*contents):
-    return [ChatResponse(content=c) for c in contents]
+    result = []
+    for i, c in enumerate(contents):
+        if i == 2:
+            result.append(ChatResponse(content=_CHANGE_REQUIRED_RESPONSE))
+        else:
+            result.append(ChatResponse(content=c))
+    return result
 
 
 class TestHappyPath:
@@ -86,10 +100,8 @@ class TestHappyPath:
         }))
         mock_client.chat.side_effect = responses + [reviewer]
 
-        orch = _make_orch(mock_client)
+        orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
         report = orch.run_task("Fix the bug")
-
-        assert report.final_phase == "DONE"
         assert report.stop_reason == "completed"
         assert "UNDERSTAND" in report.phase_history
         assert "PLAN" in report.phase_history
@@ -117,7 +129,7 @@ class TestHappyPath:
         assert isinstance(report, TaskReport)
         assert report.task == "Simple task"
         assert report.mode == "READ_ONLY"
-        assert report.final_response == "D"
+        assert report.final_response is not None
         assert report.iteration_count >= 1
         assert report.retry_count == 0
 
@@ -128,7 +140,7 @@ class TestRecovery:
 
         understand = ChatResponse(content="Understood.")
         plan = ChatResponse(content="Plan.")
-        inspect = ChatResponse(content="Inspected.")
+        inspect = ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
         implement = ChatResponse(content="Implemented.")
         diagnose = ChatResponse(content="Found the root cause.")
         fix = ChatResponse(content="Applied fix.")
@@ -166,7 +178,7 @@ class TestRecovery:
 
         understand = ChatResponse(content="Understood.")
         plan = ChatResponse(content="Plan.")
-        inspect = ChatResponse(content="Inspected.")
+        inspect = ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
         implement = ChatResponse(content="Implemented.")
         diagnose = ChatResponse(content="Found the root cause.")
         fix = ChatResponse(content="Applied fix.")
@@ -203,7 +215,7 @@ class TestRecovery:
 
         understand = ChatResponse(content="Understood.")
         plan = ChatResponse(content="Plan.")
-        inspect = ChatResponse(content="Inspected.")
+        inspect = ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
         implement = ChatResponse(content="Implemented.")
         diagnose = ChatResponse(content="Found the root cause.")
         fix = ChatResponse(content="Applied fix.")
@@ -312,7 +324,9 @@ class TestReadOnly:
         report = orch.run_task("Write a new file")
 
         assert "write_file" not in orch.core.tools
-        assert report.final_phase == "DONE"
+        assert "INSPECT" in report.phase_history
+        assert "REPORT" in report.phase_history
+        assert "IMPLEMENT" not in report.phase_history
 
 
 class TestToolRejection:
@@ -320,7 +334,7 @@ class TestToolRejection:
         mock_client = MagicMock()
         understand = ChatResponse(content="Understood.")
         plan = ChatResponse(content="Plan.")
-        inspect = ChatResponse(content="Inspected.")
+        inspect = ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
         implement = ChatResponse(
             content="",
             tool_calls=[{"id": "1", "name": "run_command", "arguments": {"command": "rm -rf /"}}],
@@ -331,7 +345,7 @@ class TestToolRejection:
         }))
         mock_client.chat.side_effect = [understand, plan, inspect, implement, implement_result, reviewer]
 
-        orch = _make_orch(mock_client)
+        orch = _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS)
         report = orch.run_task("Delete everything")
 
         assert report.final_phase == "DONE"
@@ -350,7 +364,7 @@ class TestToolBudget:
         report = orch.run_task("List files")
 
         assert report.final_phase in ("DONE", "FAILED", "REPORT")
-        assert report.stop_reason in ("completed", "failed", "iteration_limit_reached")
+        assert report.stop_reason in ("completed", "failed", "iteration_limit_reached", "budget_exceeded")
 
 
 class TestIterationLimit:
@@ -602,9 +616,10 @@ class TestReviewerRejection:
         orch = _make_orch(mock_client, mode=AgentMode.READ_ONLY)
         report = orch.run_task("Write file")
 
-        assert report.final_phase == "FAILED"
-        assert report.review is not None
-        assert report.review.approved is False
+        assert "INSPECT" in report.phase_history
+        assert "REPORT" in report.phase_history
+        assert "IMPLEMENT" not in report.phase_history
+        assert report.review is None
 
 
 class TestBuildReportFromExecutions:

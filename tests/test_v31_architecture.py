@@ -18,8 +18,22 @@ from app.llm.openrouter import ChatResponse
 from app.models.schemas import TaskReport
 
 
+_CHANGE_REQUIRED_RESPONSE = json.dumps({
+    "decision": "CHANGE_REQUIRED",
+    "confidence": 0.95,
+    "reason": "Inspection identified work required for the requested task.",
+    "evidence": ["inspection completed"],
+})
+
+
 def _phase_responses(*contents):
-    return [ChatResponse(content=c) for c in contents]
+    result = []
+    for i, c in enumerate(contents):
+        if i == 2:
+            result.append(ChatResponse(content=_CHANGE_REQUIRED_RESPONSE))
+        else:
+            result.append(ChatResponse(content=c))
+    return result
 
 
 def _review_response(approved=True, summary="LGTM"):
@@ -51,7 +65,13 @@ def _make_plan_json(objective="fix bug", subtasks=None):
 
 def _infinite_responses(*defaults):
     """Return a side_effect function that always returns a ChatResponse."""
-    responses = [ChatResponse(content=c) if isinstance(c, str) else c for c in defaults]
+    converted = []
+    for c in defaults:
+        if isinstance(c, str) and c == "Inspected.":
+            converted.append(ChatResponse(content=_CHANGE_REQUIRED_RESPONSE))
+        else:
+            converted.append(ChatResponse(content=c) if isinstance(c, str) else c)
+    responses = converted
     idx = [0]
 
     def side_effect(*args, **kwargs):
@@ -285,7 +305,7 @@ class TestDynamicReplanning:
             elif "Phase: PLAN" in content:
                 return ChatResponse(content=plan)
             elif "Phase: INSPECT" in content:
-                return ChatResponse(content="Inspected.")
+                return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
             elif "Phase: IMPLEMENT" in content:
                 return ChatResponse(content="Implemented.")
             elif "Phase: DIAGNOSE" in content:
@@ -368,7 +388,7 @@ class TestDynamicReplanning:
             elif "Phase: PLAN" in content:
                 return ChatResponse(content=plan)
             elif "Phase: INSPECT" in content:
-                return ChatResponse(content="Inspected.")
+                return ChatResponse(content=_CHANGE_REQUIRED_RESPONSE)
             elif "Phase: IMPLEMENT" in content:
                 return ChatResponse(content="Attempted.")
             elif "Phase: DIAGNOSE" in content:

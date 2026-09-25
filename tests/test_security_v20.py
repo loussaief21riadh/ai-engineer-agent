@@ -16,6 +16,13 @@ from app.tools.edit import EditFileTool
 from app.tools.security import contains_shell_metacharacters, is_secret_path
 from app.tools.terminal import _validate_command
 
+_CHANGE_REQUIRED_RESPONSE = json.dumps({
+    "decision": "CHANGE_REQUIRED",
+    "confidence": 0.95,
+    "reason": "Inspection identified work required for the requested task.",
+    "evidence": ["inspection completed"],
+})
+
 
 class TestShellTrueNeverPassed:
     @patch("app.tools.terminal.subprocess.run")
@@ -227,7 +234,7 @@ class TestAntiFabrication:
         responses = [
             ChatResponse(content="I modified app/main.py."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Done."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -285,7 +292,7 @@ class TestModeRestrictions:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Cannot write."),
         ]
         reviewer = ChatResponse(content=json.dumps({

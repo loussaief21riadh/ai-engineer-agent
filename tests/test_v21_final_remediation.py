@@ -32,6 +32,13 @@ from app.tools.terminal import (
     _validate_command,
 )
 
+_CHANGE_REQUIRED_RESPONSE = json.dumps({
+    "decision": "CHANGE_REQUIRED",
+    "confidence": 0.95,
+    "reason": "Inspection identified work required for the requested task.",
+    "evidence": ["inspection completed"],
+})
+
 
 # ============================================================
 # FIX-1: TEST → DONE bypass removed
@@ -82,7 +89,7 @@ class TestFIX1TestToDoneBypassRemoved:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -487,7 +494,7 @@ class TestFIX7ModelRouterWired:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -512,7 +519,7 @@ class TestFIX7ModelRouterWired:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -540,7 +547,7 @@ class TestFIX7ModelRouterWired:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -572,7 +579,7 @@ class TestFIX8SecurityCheckCriticalBlocking:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -599,7 +606,7 @@ class TestFIX8SecurityCheckCriticalBlocking:
         mock_client.chat.side_effect = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
 
@@ -731,7 +738,7 @@ class TestFullPipelineRegression:
         responses = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
         reviewer = ChatResponse(content=json.dumps({
@@ -769,7 +776,7 @@ class TestFullPipelineRegression:
         mock_client.chat.side_effect = [
             ChatResponse(content="Understood."),
             ChatResponse(content="Plan."),
-            ChatResponse(content="Inspected."),
+            ChatResponse(content=_CHANGE_REQUIRED_RESPONSE),
             ChatResponse(content="Implemented."),
         ]
 

@@ -95,8 +95,10 @@ class ProjectUnderstandingEngine:
         ext_counts: dict[str, int] = {}
         ext_map: dict[str, list[str]] = {}
 
-        for root, _dirs, files in os.walk(self.root_path):
-            if ".git" in root or "__pycache__" in root or ".venv" in root:
+        _skip = {".git", "__pycache__", ".venv", ".opencode", "node_modules"}
+        for root, dirs, files in os.walk(self.root_path):
+            dirs[:] = [d for d in dirs if d not in _skip]
+            if ".git" in root or "__pycache__" in root or ".venv" in root or ".opencode" in root:
                 continue
             for f in files:
                 filepath = Path(root) / f
@@ -133,8 +135,10 @@ class ProjectUnderstandingEngine:
             "spring": "Spring", "rails": "Rails",
         }
 
-        for root, _dirs, files in os.walk(self.root_path):
-            if ".git" in root or "__pycache__" in root:
+        _skip = {".git", "__pycache__", ".venv", ".opencode", "node_modules"}
+        for root, dirs, files in os.walk(self.root_path):
+            dirs[:] = [d for d in dirs if d not in _skip]
+            if ".git" in root or "__pycache__" in root or ".opencode" in root:
                 continue
             for f in files:
                 f_lower = f.lower()
@@ -175,10 +179,11 @@ class ProjectUnderstandingEngine:
                 pass
 
     def _scan_modules(self, profile: ProjectProfile) -> None:
+        _skip = {".git", "__pycache__", ".venv", ".opencode", "node_modules"}
         for root, dirs, files in os.walk(self.root_path):
-            if ".git" in root or "__pycache__" in root or ".venv" in root:
+            dirs[:] = [d for d in dirs if d not in _skip]
+            if ".git" in root or "__pycache__" in root or ".venv" in root or ".opencode" in root:
                 continue
-            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".venv", "node_modules"}]
 
             for f in files:
                 if not f.endswith(".py"):
@@ -218,8 +223,10 @@ class ProjectUnderstandingEngine:
             profile.entrypoints.append("app/main.py")
 
     def _detect_config_files(self, profile: ProjectProfile) -> None:
-        for root, _dirs, files in os.walk(self.root_path):
-            if ".git" in root:
+        _skip = {".git", "__pycache__", ".venv", ".opencode", "node_modules"}
+        for root, dirs, files in os.walk(self.root_path):
+            dirs[:] = [d for d in dirs if d not in _skip]
+            if ".git" in root or ".opencode" in root:
                 continue
             for f in files:
                 if f in self.CONFIG_PATTERNS or f.endswith((".cfg", ".ini", ".toml", ".yaml", ".yml")):
@@ -232,8 +239,10 @@ class ProjectUnderstandingEngine:
 
     def _detect_documentation(self, profile: ProjectProfile) -> None:
         doc_patterns = {"README", "CHANGELOG", "CONTRIBUTING", "LICENSE", "SECURITY"}
-        for root, _dirs, files in os.walk(self.root_path):
-            if ".git" in root:
+        _skip = {".git", "__pycache__", ".venv", ".opencode", "node_modules"}
+        for root, dirs, files in os.walk(self.root_path):
+            dirs[:] = [d for d in dirs if d not in _skip]
+            if ".git" in root or ".opencode" in root:
                 continue
             for f in files:
                 if any(p in f.upper() for p in doc_patterns) or f.endswith((".md", ".rst", ".txt")):

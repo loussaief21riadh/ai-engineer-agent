@@ -30,7 +30,16 @@ def _make_orch(mock_client, mode=AgentMode.ALLOW_EDITS):
 
 
 def _phase_responses(*contents):
-    return [ChatResponse(content=c) for c in contents]
+    result = []
+    for i, c in enumerate(contents):
+        if i == 2:
+            result.append(ChatResponse(content=json.dumps({
+                "decision": "CHANGE_REQUIRED", "confidence": 0.9,
+                "reason": c, "evidence": [],
+            })))
+        else:
+            result.append(ChatResponse(content=c))
+    return result
 
 
 def _review_response(approved=True, findings=None, summary="LGTM", verdict="APPROVE"):
@@ -45,16 +54,19 @@ def _review_response(approved=True, findings=None, summary="LGTM", verdict="APPR
 class TestEndToEndHappyPath:
     def test_full_cycle_with_context_continuity(self):
         mock_client = MagicMock()
-        responses = _phase_responses(
-            "Task is clear: fix the import error in main.py",
-            "Plan: 1. Inspect main.py, 2. Fix import, 3. Test",
-            "Read main.py: found missing import of os module",
-            "Added 'import os' to main.py",
-        )
+        understand = ChatResponse(content="Task is clear: fix the import error in main.py")
+        plan = ChatResponse(content="Plan: 1. Inspect main.py, 2. Fix import, 3. Test")
+        inspect = ChatResponse(content=json.dumps({
+            "decision": "CHANGE_REQUIRED",
+            "confidence": 0.95,
+            "reason": "Found missing import of os module in main.py",
+            "evidence": ["app/main.py"],
+        }))
+        implement = ChatResponse(content="Added 'import os' to main.py")
         reviewer = ChatResponse(content=json.dumps({
             "approved": True, "verdict": "APPROVE", "findings": [], "summary": "LGTM",
         }))
-        mock_client.chat.side_effect = responses + [reviewer]
+        mock_client.chat.side_effect = [understand, plan, inspect, implement, reviewer]
 
         orch = _make_orch(mock_client)
         report = orch.run_task("Fix import error in main.py")
@@ -77,15 +89,20 @@ class TestEndToEndHappyPath:
         understand = ChatResponse(content="Found the issue in app/main.py")
         plan = ChatResponse(content="Plan: read main.py, fix the bug")
         inspect = ChatResponse(
-            content="",
+            content=json.dumps({
+                "decision": "CHANGE_REQUIRED",
+                "confidence": 0.9,
+                "reason": "Found the bug at line 42",
+                "evidence": ["app/main.py"],
+            }),
             tool_calls=[{"id": "1", "name": "read_file", "arguments": {"path": "app/main.py"}}],
         )
-        inspect_result = ChatResponse(content="Read app/main.py: line 42 has the bug")
         implement = ChatResponse(content="Fixed line 42")
+        test_summary = ChatResponse(content="Tests passed after fix.")
         reviewer = ChatResponse(content=json.dumps({
             "approved": True, "verdict": "APPROVE", "findings": [], "summary": "OK",
         }))
-        mock_client.chat.side_effect = [understand, plan, inspect, inspect_result, implement, reviewer]
+        mock_client.chat.side_effect = [understand, plan, inspect, implement, test_summary, reviewer]
 
         orch = _make_orch(mock_client)
         report = orch.run_task("Fix the bug in main.py")
