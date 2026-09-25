@@ -6,7 +6,7 @@ from app.models.schemas import TaskReport
 
 
 def print_header(orchestrator: Orchestrator) -> None:
-    print("\n=== AI ENGINEER AGENT V2.0 ===")
+    print("\n=== AI ENGINEER AGENT V5 ===")
     print(f"Project: {PROJECT_ROOT}")
     print(f"Mode: {orchestrator.mode.value}")
     print("Type /help for commands, /exit to quit.\n")

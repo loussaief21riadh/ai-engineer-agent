@@ -1733,17 +1733,6 @@ class Orchestrator:
             trust=TrustLevel.MODEL_INFERRED,
         )
 
-        reflection = self.reflection_engine.reflect(
-            test_failures,
-            evidence=diag.suggested_fix,
-            context=task[:200],
-        )
-        self.exec_trace.add_event("self_reflection", {
-            "decision": reflection.decision.value,
-            "confidence": reflection.confidence,
-            "what_failed": reflection.what_failed,
-        })
-
         if self._current_subtask_id and self._task_plan:
             idx = self._current_subtask_index
             if 0 <= idx < len(self._task_plan.subtasks):
